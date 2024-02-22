@@ -1,0 +1,10 @@
+kind: ClusterRole
+metadata:
+  name: beyla
+rules:
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets" ]
+    verbs: [ "list", "watch" ]
+  - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "list", "watch" ]

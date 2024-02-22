@@ -1,0 +1,166 @@
+## This chart runs Beyla as a daemonset and instrumented signals can be visualized on Grafana Cloud
+## Create OTLP endpoint from Grafana Cloud and pass it under secrets section
+## Use discovery section to add applications you would want instrumented in k8's environment
+## Then you are good to go!
+
+global:
+  # -- Overrides the Docker registry globally for all images
+  imageRegistry: null
+  # Secrets to be used authentication to imageRegistry
+  imagePullSecrets: []
+
+
+rbac:
+  create: true
+  ## Use an existing ClusterRole/Role (depending on rbac.namespaced false/true)
+  # useExistingRole: name-of-some-role
+  # useExistingClusterRole: name-of-some-clusterRole
+  pspEnabled: false  # psp is deprecated ?  pod security admissions
+  pspUseAppArmor: false    ## Security feature. to restrict pod resource, admission etc
+  namespaced: false
+  extraRoleRules: []
+  # - apiGroups: []
+  #   resources: []
+  #   verbs: []
+  extraClusterRoleRules: []
+  # - apiGroups: []
+  #   resources: []
+  #   verbs: []
+  
+serviceAccount:
+  create: true
+  name:
+  nameTest:
+  ## ServiceAccount labels.
+  labels: {}
+  annotations: {}
+
+
+
+## See `kubectl explain deployment.spec.strategy` for more
+## ref: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy
+
+## Rolling strategy for daemonsets is  avaiabled in k8's > 1.6 
+deploymentStrategy:
+  type: RollingUpdate
+
+
+image:
+  # -- The Docker registry
+  registry: docker.io
+  # -- Docker image repository
+  repository: grafana/beyla:main
+  # Overrides the Grafana image tag whose default is the chart appVersion
+  tag: ""
+  sha: ""
+  pullPolicy: IfNotPresent
+
+  ## Optionally specify an array of imagePullSecrets.
+  ## Secrets must be manually created in the namespace.
+  ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+  ## Can be templated.
+  ##
+  pullSecrets: []
+  #   - myRegistrKeySecretName
+
+
+## maybe we won't provision beyla as a sidecar?
+
+daemonset:
+  enabled: true
+  port:
+
+  serviceName: "?"
+
+
+# visualization:
+#   # default querying tool is grafana cloud
+#   enabled: false
+#   grafana:
+#     enabled: true
+#     port: 8080
+
+
+configmap:
+  routes: # some more configurations here - should check it out
+
+  discovery:
+    services:
+      # Instrument any process using the ports from 8080 to 8089
+      # - open_ports: 8080-8089
+      - open_ports: 
+      # Instrument any process whose executable contains "http"
+      # - exe_path: "http"
+      - exe_path:
+      # Instrument any process with an executable containing "nginx"
+      # and using the port 443 (both conditions must be fulfilled)
+      # - open_ports: 443
+      #   exe_path: "nginx"
+
+      - k8s_deployment_name: {}
+      - k8s_namespace: {}
+      - k8s_replicaset_name: {}
+      - k8s_pod_name: {}
+      
+  log_level: 
+
+
+
+## Could be moved to beyla.ini
+## Assuming beyla is directly exporting to grafana's otlp endpoint
+exporter:
+  enabled: false 
+  endpoint:
+  headers:
+
+readinessProbe:
+  httpGet:
+    path: /api/health
+    port: 3000
+
+livenessProbe:
+  httpGet:
+    path: /api/health
+    port: 3000
+  initialDelaySeconds: 60
+  timeoutSeconds: 30
+  failureThreshold: 10
+
+
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 472
+  runAsGroup: 472
+  fsGroup: 472
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+
+
+## Use an alternate scheduler, e.g. "stork".
+## ref: https://kubernetes.io/docs/tasks/administer-cluster/configure-multiple-schedulers/
+##
+# schedulerName: "default-scheduler"
+
+
+## Node labels for pod assignment
+## ref: https://kubernetes.io/docs/user-guide/node-selection/
+#
+nodeSelector: {}
+
+## Tolerations for pod assignment
+## ref: https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/
+##
+tolerations: []
+
+nodeaffinity: {}
+
+## Assign a PriorityClassName to pods if set
+# priorityClassName:
