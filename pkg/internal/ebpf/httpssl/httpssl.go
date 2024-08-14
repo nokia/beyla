@@ -33,7 +33,6 @@ type Tracer struct {
 	bpfObjects bpfObjects
 	closers    []io.Closer
 	log        *slog.Logger
-	Service    *svc.ID
 }
 
 func New(cfg *beyla.Config, metrics imetrics.Reporter) *Tracer {
@@ -46,12 +45,12 @@ func New(cfg *beyla.Config, metrics imetrics.Reporter) *Tracer {
 	}
 }
 
-func (p *Tracer) AllowPID(pid uint32, svc svc.ID) {
-	p.pidsFilter.AllowPID(pid, svc, ebpfcommon.PIDTypeKProbes)
+func (p *Tracer) AllowPID(pid, ns uint32, svc svc.ID) {
+	p.pidsFilter.AllowPID(pid, ns, svc, ebpfcommon.PIDTypeKProbes)
 }
 
-func (p *Tracer) BlockPID(pid uint32) {
-	p.pidsFilter.BlockPID(pid)
+func (p *Tracer) BlockPID(pid, ns uint32) {
+	p.pidsFilter.BlockPID(pid, ns)
 }
 
 func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
@@ -72,6 +71,32 @@ func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
 	}
 
 	return loader()
+}
+
+func (p *Tracer) SetupTailCalls() {
+	for _, tc := range []struct {
+		index int
+		prog  *ebpf.Program
+	}{
+		{
+			index: 0,
+			prog:  p.bpfObjects.ProtocolHttp,
+		},
+		{
+			index: 1,
+			prog:  p.bpfObjects.ProtocolHttp2,
+		},
+		{
+			index: 2,
+			prog:  p.bpfObjects.ProtocolTcp,
+		},
+	} {
+		err := p.bpfObjects.JumpTable.Update(uint32(tc.index), uint32(tc.prog.FD()), ebpf.UpdateAny)
+
+		if err != nil {
+			p.log.Error("error loading info tail call jump table", "error", err)
+		}
+	}
 }
 
 func (p *Tracer) Constants(_ *exec.FileInfo, _ *goexec.Offsets) map[string]any {
@@ -149,27 +174,6 @@ func (p *Tracer) UProbes() map[string]map[string]ebpfcommon.FunctionPrograms {
 				Start:    p.bpfObjects.UprobeSslShutdown,
 			},
 		},
-		"libSystem.Security.Cryptography.Native.OpenSsl.so": {
-			"CryptoNative_SslRead": {
-				Required: false,
-				Start:    p.bpfObjects.UprobeSslRead,
-				End:      p.bpfObjects.UretprobeSslRead,
-			},
-			"CryptoNative_SslWrite": {
-				Required: false,
-				Start:    p.bpfObjects.UprobeSslWrite,
-				End:      p.bpfObjects.UretprobeSslWrite,
-			},
-			"CryptoNative_SslDoHandshake": {
-				Required: false,
-				Start:    p.bpfObjects.UprobeSslDoHandshake,
-				End:      p.bpfObjects.UretprobeSslDoHandshake,
-			},
-			"CryptoNative_SslShutdown": {
-				Required: false,
-				Start:    p.bpfObjects.UprobeSslShutdown,
-			},
-		},
 	}
 }
 
@@ -198,6 +202,5 @@ func (p *Tracer) Run(ctx context.Context, eventsChan chan<- []request.Span) {
 		p.pidsFilter,
 		p.bpfObjects.Events,
 		p.metrics,
-		append(p.closers, &p.bpfObjects)...,
-	)(ctx, eventsChan)
+	)(ctx, append(p.closers, &p.bpfObjects), eventsChan)
 }

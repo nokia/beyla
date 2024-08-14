@@ -3,73 +3,63 @@ package kube
 import (
 	"strings"
 
-	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	attr "github.com/grafana/beyla/pkg/export/attributes/names"
 )
+
+type OwnerLabel attr.Name
 
 const (
-	NamespaceName   = "k8s.namespace.name"
-	PodName         = "k8s.pod.name"
-	DeploymentName  = "k8s.deployment.name"
-	ReplicaSetName  = "k8s.replicaset.name"
-	DaemonSetName   = "k8s.daemonset.name"
-	StatefulSetName = "k8s.statefulset.name"
-	NodeName        = "k8s.node.name"
-	PodUID          = "k8s.pod.uid"
-	PodStartTime    = "k8s.pod.start_time"
+	OwnerReplicaSet  = OwnerLabel(attr.K8sReplicaSetName)
+	OwnerDeployment  = OwnerLabel(attr.K8sDeploymentName)
+	OwnerStatefulSet = OwnerLabel(attr.K8sStatefulSetName)
+	OwnerDaemonSet   = OwnerLabel(attr.K8sDaemonSetName)
+	OwnerUnknown     = OwnerLabel(attr.K8sUnknownOwnerName)
 )
-
-type OwnerType int
-
-const (
-	OwnerUnknown = OwnerType(iota)
-	OwnerReplicaSet
-	OwnerDeployment
-	OwnerStatefulSet
-	OwnerDaemonSet
-)
-
-func (o OwnerType) LabelName() string {
-	switch o {
-	case OwnerReplicaSet:
-		return ReplicaSetName
-	case OwnerDeployment:
-		return DeploymentName
-	case OwnerStatefulSet:
-		return StatefulSetName
-	case OwnerDaemonSet:
-		return DaemonSetName
-	default:
-		return "k8s.unknown.owner"
-	}
-}
 
 type Owner struct {
-	Type OwnerType
-	Name string
+	Kind      string
+	LabelName OwnerLabel
+	Name      string
 	// Owner of the owner. For example, a ReplicaSet might be owned by a Deployment
 	Owner *Owner
 }
 
-// OwnerFromPodInfo returns the pod Owner reference. It might be
-// null if the Pod does not have any owner
-func OwnerFromPodInfo(pod *v1.Pod) *Owner {
-	for i := range pod.OwnerReferences {
-		or := &pod.OwnerReferences[i]
+// OwnerFrom returns the most plausible Owner reference. It might be
+// null if the entity does not have any owner
+func OwnerFrom(orefs []metav1.OwnerReference) *Owner {
+	// fallback will store any found owner that is not part of the bundled
+	// K8s owner types (e.g. argocd rollouts).
+	// It will be returned if any of the standard K8s owners are found
+	var fallback *Owner
+	for i := range orefs {
+		or := &orefs[i]
 		if or.APIVersion != "apps/v1" {
+			fallback = unrecognizedOwner(or)
 			continue
 		}
 		switch or.Kind {
 		case "ReplicaSet":
-			return &Owner{Type: OwnerReplicaSet, Name: or.Name}
+			return &Owner{LabelName: OwnerReplicaSet, Name: or.Name, Kind: or.Kind}
 		case "Deployment":
-			return &Owner{Type: OwnerDeployment, Name: or.Name}
+			return &Owner{LabelName: OwnerDeployment, Name: or.Name, Kind: or.Kind}
 		case "StatefulSet":
-			return &Owner{Type: OwnerStatefulSet, Name: or.Name}
+			return &Owner{LabelName: OwnerStatefulSet, Name: or.Name, Kind: or.Kind}
 		case "DaemonSet":
-			return &Owner{Type: OwnerDaemonSet, Name: or.Name}
+			return &Owner{LabelName: OwnerDaemonSet, Name: or.Name, Kind: or.Kind}
+		default:
+			fallback = unrecognizedOwner(or)
 		}
 	}
-	return nil
+	return fallback
+}
+
+func unrecognizedOwner(or *metav1.OwnerReference) *Owner {
+	return &Owner{
+		LabelName: OwnerLabel(attr.K8sUnknownOwnerName),
+		Name:      or.Name,
+	}
 }
 
 func (o *Owner) String() string {
@@ -83,7 +73,7 @@ func (o *Owner) string(sb *strings.Builder) {
 		o.Owner.string(sb)
 		sb.WriteString("->")
 	}
-	sb.WriteString(o.Type.LabelName())
+	sb.WriteString(string(o.LabelName))
 	sb.WriteByte(':')
 	sb.WriteString(o.Name)
 }

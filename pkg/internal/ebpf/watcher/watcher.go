@@ -81,6 +81,8 @@ func (p *Watcher) Tracepoints() map[string]ebpfcommon.FunctionPrograms {
 	return nil
 }
 
+func (p *Watcher) SetupTailCalls() {}
+
 func (p *Watcher) Run(ctx context.Context) {
 	p.events <- Event{Type: Ready}
 	ebpfcommon.ForwardRingbuf(
@@ -94,7 +96,7 @@ func (p *Watcher) Run(ctx context.Context) {
 	)(ctx, nil)
 }
 
-func (p *Watcher) processWatchEvent(record *ringbuf.Record) (request.Span, bool, error) {
+func (p *Watcher) processWatchEvent(record *ringbuf.Record, _ ebpfcommon.ServiceFilter) (request.Span, bool, error) {
 	var flags uint64
 	var event BPFWatchInfo
 

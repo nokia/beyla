@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 
 	common "github.com/grafana/beyla/pkg/internal/ebpf/common"
 	"github.com/grafana/beyla/pkg/internal/request"
@@ -75,6 +76,7 @@ func (pt *ProcessTracer) tracers() ([]Tracer, error) {
 			if strings.Contains(err.Error(), "unknown func bpf_probe_write_user") {
 				plog.Warn("Failed to enable distributed tracing context-propagation on a Linux Kernel without write memory support. " +
 					"To avoid seeing this message, please ensure you have correctly mounted /sys/kernel/security. " +
+					"and ensure beyla has the SYS_ADMIN linux capability" +
 					"For more details set BEYLA_LOG_LEVEL=DEBUG.")
 
 				common.IntegrityModeOverride = true
@@ -92,36 +94,40 @@ func (pt *ProcessTracer) tracers() ([]Tracer, error) {
 				return nil, fmt.Errorf("loading and assigning BPF objects: %w", err)
 			}
 		}
+
+		// Setup any tail call jump tables
+		p.SetupTailCalls()
+
 		i := instrumenter{
 			exe:     pt.Exe,
 			offsets: pt.Goffsets,
 		}
 
-		//Go style Uprobes
+		// Go style Uprobes
 		if err := i.goprobes(p); err != nil {
 			printVerifierErrorInfo(err)
 			return nil, err
 		}
 
-		//Kprobes to be used for native instrumentation points
+		// Kprobes to be used for native instrumentation points
 		if err := i.kprobes(p); err != nil {
 			printVerifierErrorInfo(err)
 			return nil, err
 		}
 
-		//Uprobes to be used for native module instrumentation points
+		// Uprobes to be used for native module instrumentation points
 		if err := i.uprobes(pt.ELFInfo.Pid, p); err != nil {
 			printVerifierErrorInfo(err)
 			return nil, err
 		}
 
-		//Tracepoints support
+		// Tracepoints support
 		if err := i.tracepoints(p); err != nil {
 			printVerifierErrorInfo(err)
 			return nil, err
 		}
 
-		//Sock filters support
+		// Sock filters support
 		if err := i.sockfilters(p); err != nil {
 			printVerifierErrorInfo(err)
 			return nil, err
@@ -129,6 +135,8 @@ func (pt *ProcessTracer) tracers() ([]Tracer, error) {
 
 		tracers = append(tracers, p)
 	}
+
+	btf.FlushKernelSpec()
 
 	return tracers, nil
 }
@@ -168,6 +176,8 @@ func RunUtilityTracer(p UtilityTracer, pinPath string) error {
 	}
 
 	go p.Run(context.Background())
+
+	btf.FlushKernelSpec()
 
 	return nil
 }

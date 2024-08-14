@@ -21,49 +21,8 @@
 
 #include "bpf_helpers.h"
 #include "bpf_endian.h"
-
-#include "flow.h"
-
-#define DISCARD 1
-#define SUBMIT 0
-
-// according to field 61 in https://www.iana.org/assignments/ipfix/ipfix.xhtml
-#define INGRESS 0
-#define EGRESS 1
-
-// Flags according to RFC 9293 & https://www.iana.org/assignments/ipfix/ipfix.xhtml
-#define FIN_FLAG 0x01
-#define SYN_FLAG 0x02
-#define RST_FLAG 0x04
-#define PSH_FLAG 0x08
-#define ACK_FLAG 0x10
-#define URG_FLAG 0x20
-#define ECE_FLAG 0x40
-#define CWR_FLAG 0x80
-// Custom flags exported
-#define SYN_ACK_FLAG 0x100
-#define FIN_ACK_FLAG 0x200
-#define RST_ACK_FLAG 0x400
-
-// Common Ringbuffer as a conduit for ingress/egress flows to userspace
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
-} direct_flows SEC(".maps");
-
-// Key: the flow identifier. Value: the flow metrics for that identifier.
-// The userspace will aggregate them into a single flow.
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
-    __type(key, flow_id);
-    __type(value, flow_metrics);
-} aggregated_flows SEC(".maps");
-
-// Constant definitions, to be overridden by the invoker
-volatile const u32 sampling = 0;
-volatile const u8 trace_messages = 0;
-
-const u8 ip4in6[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+#include "bpf_dbg.h"
+#include "flows_common.h"
 
 // sets the TCP header flags for connection information
 static inline void set_flags(struct tcphdr *th, u16 *flags) {
@@ -107,7 +66,7 @@ static inline int fill_iphdr(struct iphdr *ip, void *data_end, flow_id *id, u16 
     id->dst_port = 0;
     switch (ip->protocol) {
     case IPPROTO_TCP: {
-        struct tcphdr *tcp = (void *)ip + sizeof(*ip);
+        struct tcphdr *tcp = (struct tcphdr *)((void *)ip + sizeof(*ip));
         if ((void *)tcp + sizeof(*tcp) <= data_end) {
             id->src_port = __bpf_ntohs(tcp->source);
             id->dst_port = __bpf_ntohs(tcp->dest);
@@ -115,7 +74,7 @@ static inline int fill_iphdr(struct iphdr *ip, void *data_end, flow_id *id, u16 
         }
     } break;
     case IPPROTO_UDP: {
-        struct udphdr *udp = (void *)ip + sizeof(*ip);
+        struct udphdr *udp = (struct udphdr *)((void *)ip + sizeof(*ip));
         if ((void *)udp + sizeof(*udp) <= data_end) {
             id->src_port = __bpf_ntohs(udp->source);
             id->dst_port = __bpf_ntohs(udp->dest);
@@ -140,7 +99,7 @@ static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, flow_id *id, u
     id->dst_port = 0;
     switch (ip->nexthdr) {
     case IPPROTO_TCP: {
-        struct tcphdr *tcp = (void *)ip + sizeof(*ip);
+        struct tcphdr *tcp = (struct tcphdr *)((void *)ip + sizeof(*ip));
         if ((void *)tcp + sizeof(*tcp) <= data_end) {
             id->src_port = __bpf_ntohs(tcp->source);
             id->dst_port = __bpf_ntohs(tcp->dest);
@@ -148,7 +107,7 @@ static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, flow_id *id, u
         }
     } break;
     case IPPROTO_UDP: {
-        struct udphdr *udp = (void *)ip + sizeof(*ip);
+        struct udphdr *udp = (struct udphdr *)((void *)ip + sizeof(*ip));
         if ((void *)udp + sizeof(*udp) <= data_end) {
             id->src_port = __bpf_ntohs(udp->source);
             id->dst_port = __bpf_ntohs(udp->dest);
@@ -168,10 +127,10 @@ static inline int fill_ethhdr(struct ethhdr *eth, void *data_end, flow_id *id, u
     id->eth_protocol = __bpf_ntohs(eth->h_proto);
 
     if (id->eth_protocol == ETH_P_IP) {
-        struct iphdr *ip = (void *)eth + sizeof(*eth);
+        struct iphdr *ip = (struct iphdr *)((void *)eth + sizeof(*eth));
         return fill_iphdr(ip, data_end, id, flags);
     } else if (id->eth_protocol == ETH_P_IPV6) {
-        struct ipv6hdr *ip6 = (void *)eth + sizeof(*eth);
+        struct ipv6hdr *ip6 = (struct ipv6hdr *)((void *)eth + sizeof(*eth));
         return fill_ip6hdr(ip6, data_end, id, flags);
     } else {
         // TODO : Need to implement other specific ethertypes if needed
@@ -185,7 +144,7 @@ static inline int fill_ethhdr(struct ethhdr *eth, void *data_end, flow_id *id, u
     return SUBMIT;
 }
 
-static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
+static inline int flow_monitor(struct __sk_buff *skb) {
     // If sampling is defined, will only parse 1 out of "sampling" flows
     if (sampling != 0 && (bpf_get_prandom_u32() % sampling) != 0) {
         return TC_ACT_OK;
@@ -195,16 +154,14 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
 
     flow_id id;
     __builtin_memset(&id, 0, sizeof(id));
-    u64 current_time = bpf_ktime_get_ns();
-    struct ethhdr *eth = data;
+    struct ethhdr *eth = (struct ethhdr *)data;
     u16 flags = 0;
     if (fill_ethhdr(eth, data_end, &id, &flags) == DISCARD) {
         return TC_ACT_OK;
     }
-
-    //Set extra fields
     id.if_index = skb->ifindex;
-    id.direction = direction;
+
+    u64 current_time = bpf_ktime_get_ns();
 
     // TODO: we need to add spinlock here when we deprecate versions prior to 5.1, or provide
     // a spinlocked alternative version and use it selectively https://lwn.net/Articles/779120/
@@ -227,7 +184,7 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
             // a duplicated UNION of flows (two different flows with partial aggregation of the same packets),
             // which can't be deduplicated.
             // other possible values https://chromium.googlesource.com/chromiumos/docs/+/master/constants/errnos.md
-            bpf_printk("error updating flow %d\n", ret);
+            bpf_dbg_printk("error updating flow %d\n", ret);
         }
     } else {
         // Key does not exist in the map, and will need to create a new entry.
@@ -236,8 +193,40 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
             .bytes = skb->len,
             .start_mono_time_ns = current_time,
             .end_mono_time_ns = current_time,
-            .flags = flags, 
+            .flags = flags,
+            .iface_direction = UNKNOWN,
+            .initiator = INITIATOR_UNKNOWN,
         };
+
+        u8 *direction = (u8 *)bpf_map_lookup_elem(&flow_directions, &id);
+        if(direction == NULL) {
+            // Calculate direction based on first flag received
+            // SYN and ACK mean someone else initiated the connection and this is the INGRESS direction
+            if((flags & SYN_ACK_FLAG) == SYN_ACK_FLAG) {
+                new_flow.iface_direction = INGRESS;
+            }
+            // SYN only means we initiated the connection and this is the EGRESS direction
+            else if((flags & SYN_FLAG) == SYN_FLAG) {
+                new_flow.iface_direction = EGRESS;
+            }
+            // save, when direction was calculated based on TCP flag
+            if(new_flow.iface_direction != UNKNOWN) {
+                // errors are intentionally omitted
+                bpf_map_update_elem(&flow_directions, &id, &new_flow.iface_direction, BPF_NOEXIST);
+            }
+            // fallback for lost or already started connections and UDP
+            else {
+                new_flow.iface_direction = INGRESS;
+                if (id.src_port > id.dst_port) {
+                    new_flow.iface_direction = EGRESS;
+                }
+            }
+        } else {
+            // get direction from saved flow
+            new_flow.iface_direction = *direction;
+        }
+
+        new_flow.initiator = get_connection_initiator(&id, flags);
 
         // even if we know that the entry is new, another CPU might be concurrently inserting a flow
         // so we need to specify BPF_ANY
@@ -246,36 +235,42 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
             // usually error -16 (-EBUSY) or -7 (E2BIG) is printed here.
             // In this case, we send the single-packet flow via ringbuffer as in the worst case we can have
             // a repeated INTERSECTION of flows (different flows aggregating different packets),
-            // which can be re-aggregated at userpace.
+            // which can be re-aggregated at userspace.
             // other possible values https://chromium.googlesource.com/chromiumos/docs/+/master/constants/errnos.md
             if (trace_messages) {
-                bpf_printk("error adding flow %d\n", ret);
+                bpf_dbg_printk("error adding flow %d\n", ret);
             }
 
             new_flow.errno = -ret;
             flow_record *record = (flow_record *)bpf_ringbuf_reserve(&direct_flows, sizeof(flow_record), 0);
             if (!record) {
                 if (trace_messages) {
-                    bpf_printk("couldn't reserve space in the ringbuf. Dropping flow");
+                    bpf_dbg_printk("couldn't reserve space in the ringbuf. Dropping flow");
                 }
-                return TC_ACT_OK;
+                goto cleanup;
             }
             record->id = id;
             record->metrics = new_flow;
             bpf_ringbuf_submit(record, 0);
         }
     }
+
+cleanup:
+    // finally, when flow receives FIN or RST, clean flow_directions
+    if(flags & FIN_FLAG || flags & RST_FLAG || flags & FIN_ACK_FLAG || flags & RST_ACK_FLAG) {
+        bpf_map_delete_elem(&flow_directions, &id);
+    }
     return TC_ACT_OK;
 }
 
 SEC("tc_ingress")
 int ingress_flow_parse(struct __sk_buff *skb) {
-    return flow_monitor(skb, INGRESS);
+    return flow_monitor(skb);
 }
 
 SEC("tc_egress")
 int egress_flow_parse(struct __sk_buff *skb) {
-    return flow_monitor(skb, EGRESS);
+    return flow_monitor(skb);
 }
 
 // Force emitting structs into the ELF for automatic creation of Golang struct

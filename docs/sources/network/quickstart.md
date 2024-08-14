@@ -13,6 +13,11 @@ keywords:
 Network metrics is an [experimental](/docs/release-life-cycle/) under development feature, expect breaking changes.
 {{% /admonition %}}
 
+{{% admonition type="note" %}}
+This tutorial describes how to deploy Beyla in Kubernetes from scratch.
+To use Helm, consult the [Deploy Beyla in Kubernetes with Helm]({{< relref "../setup/kubernetes-helm" >}}) documentation.
+{{% /admonition %}}
+
 # Beyla network metrics quickstart
 
 Beyla can generate network metrics in any environment (physical host, virtual host, or container). While the feature is in experimental development, it is recommended to use a Kubernetes environment, as Beyla is able to decorate each metric with the metadata of the source and destination Kubernetes entities.
@@ -140,7 +145,7 @@ Note the following requirements for this deployment configuration:
 - To listen to network packets on the host, Beyla requires the `hostNetwork: true` permission
 - To decorate the network metrics with Kubernetes metadata, create a `ClusterRole` and `ClusterRoleBinding` with `list` and `watch` permissions for ReplicaSets, Pods, Services and Nodes
 
-The configuration does not set an endpoint to export metrics. Instead, the `print_traces: true` option outputs the captured network flows to standard output.
+The configuration does not set an endpoint to export metrics. Instead, the `trace_printer: text` option outputs the captured network flows to standard output.
 
 Use `kubectl logs` to see network flow entries, for example:
 
@@ -220,17 +225,21 @@ Beyla only includes a subset of the available attributes to avoid leading to
 a [cardinality explosion](/blog/2022/02/15/what-are-cardinality-spikes-and-why-do-they-matter/) in
 the metrics storage, especially if some attributes like `src.address` or `dst.address` capture the IP addresses of the external traffic.
 
-The `allowed_attributes` YAML subsection under `network` (or the `BEYLA_NETWORK_ALLOWED_ATTRIBUTES` environment variable)
-lets to select the attributes to report:
+The `attributes.select.<metric-name>.include` YAML subsection makes it possible to select the attributes to report:
 
 ```yaml
 network:
   enable: true
-  allowed_attributes:
-    - k8s.src.owner.name
-    - k8s.src.namespace
-    - k8s.dst.owner.name
-    - k8s.dst.namespace
+attributes:
+  kubernetes:
+    enable: true
+  select:
+    beyla.network.flow.bytes:
+      include:
+      - k8s.src.owner.name
+      - k8s.src.namespace
+      - k8s.dst.owner.name
+      - k8s.dst.namespace
 ```
 
 The previous example would aggregate the `beyla.network.flow.bytes` value by source and destination Kubernetes owner
@@ -245,21 +254,26 @@ The `cidrs` YAML subsection in `network` (or the `BEYLA_NETWORK_CIDRS` environme
 subnets in [CIDR notation](https://en.wikipedia.org/wiki/Classless_Inter-Domain_Routing), in both IPv4 and IPv6 format.
 
 The existence of the `cidrs` section leaves the `src.address` and `dst.address` fields untouched,
-and adds the `src.cidr` and `dst.cidr` attributes. Don't forget to add them to the `allowed_attributes`
+and adds the `src.cidr` and `dst.cidr` attributes. Don't forget to add them to the `attributes.select`
 section:
 
 ```yaml
 network:
   enable: true
-  allowed_attributes:
-    - k8s.src.owner.name
-    - k8s.src.namespace
-    - k8s.dst.owner.name
-    - k8s.dst.namespace
-    - src.cidr
-    - dst.cidr
   cidrs:
     - 10.10.0.0/24
     - 10.0.0.0/8
     - 10.30.0.0/16
+attributes:
+  kubernetes:
+    enable: true
+  select:
+    beyla_network_flow_bytes:
+      include:
+          - k8s.src.owner.name
+          - k8s.src.namespace
+          - k8s.dst.owner.name
+          - k8s.dst.namespace
+          - src.cidr
+          - dst.cidr
 ```

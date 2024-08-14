@@ -1,28 +1,18 @@
 package transform
 
 import (
+	"context"
 	"log/slog"
-	"strings"
 	"time"
 
-	"github.com/mariomac/pipes/pkg/graph/stage"
-	"github.com/mariomac/pipes/pkg/node"
+	"github.com/mariomac/pipes/pipe"
 
+	attr "github.com/grafana/beyla/pkg/export/attributes/names"
 	"github.com/grafana/beyla/pkg/internal/kube"
 	"github.com/grafana/beyla/pkg/internal/pipe/global"
 	"github.com/grafana/beyla/pkg/internal/request"
 	"github.com/grafana/beyla/pkg/internal/svc"
-)
-
-type KubeEnableFlag string
-
-const (
-	EnabledTrue       = KubeEnableFlag("true")
-	EnabledFalse      = KubeEnableFlag("false")
-	EnabledAutodetect = KubeEnableFlag("autodetect")
-	EnabledDefault    = EnabledFalse
-
-	// TODO: let the user decide which attributes to add, as in https://opentelemetry.io/docs/kubernetes/collector/components/#kubernetes-attributes-processor
+	"github.com/grafana/beyla/pkg/kubeflags"
 )
 
 func klog() *slog.Logger {
@@ -30,7 +20,7 @@ func klog() *slog.Logger {
 }
 
 type KubernetesDecorator struct {
-	Enable KubeEnableFlag `yaml:"enable" env:"BEYLA_KUBE_METADATA_ENABLE"`
+	Enable kubeflags.EnableFlag `yaml:"enable" env:"BEYLA_KUBE_METADATA_ENABLE"`
 
 	// ClusterName overrides cluster name. If empty, the NetO11y module will try to retrieve
 	// it from the Cloud Provider Metadata (EC2, GCP and Azure), and leave it empty if it fails to.
@@ -44,33 +34,31 @@ type KubernetesDecorator struct {
 	// DropExternal will drop, in NetO11y component, any flow where the source or destination
 	// IPs are not matched to any kubernetes entity, assuming they are cluster-external
 	DropExternal bool `yaml:"drop_external" env:"BEYLA_NETWORK_DROP_EXTERNAL"`
+
+	// DisableInformers allow selectively disabling some informers. Accepted value is a list
+	// that mitght contain replicaset, node, service. Disabling any of them
+	// will cause metadata to be incomplete but will reduce the load of the Kube API.
+	// Pods informer can't be disabled. For that purpose, you should disable the whole
+	// kubernetes metadata decoration.
+	DisableInformers []string `yaml:"disable_informers" env:"BEYLA_KUBE_DISABLE_INFORMERS"`
 }
 
-func (d KubernetesDecorator) Enabled() bool {
-	switch strings.ToLower(string(d.Enable)) {
-	case string(EnabledTrue):
-		return true
-	case string(EnabledFalse), "": // empty value is disabled
-		return false
-	case string(EnabledAutodetect):
-		// We autodetect that we are in a kubernetes if we can properly load a K8s configuration file
-		_, err := kube.LoadConfig(d.KubeconfigPath)
-		if err != nil {
-			klog().Debug("kubeconfig can't be detected. Assuming we are not in Kubernetes", "error", err)
-			return false
-		}
-		return true
-	default:
-		klog().Warn("invalid value for Enable value. Ignoring stage", "value", d.Enable)
-		return false
-	}
-}
+const (
+	clusterMetadataRetries       = 5
+	clusterMetadataFailRetryTime = 500 * time.Millisecond
+)
 
 func KubeDecoratorProvider(
+	ctx context.Context,
+	cfg *KubernetesDecorator,
 	ctxInfo *global.ContextInfo,
-) stage.MiddleProvider[KubernetesDecorator, []request.Span, []request.Span] {
-	return func(cfg KubernetesDecorator) (node.MiddleFunc[[]request.Span, []request.Span], error) {
-		decorator := &metadataDecorator{db: ctxInfo.AppO11y.K8sDatabase}
+) pipe.MiddleProvider[[]request.Span, []request.Span] {
+	return func() (pipe.MiddleFunc[[]request.Span, []request.Span], error) {
+		if !ctxInfo.K8sInformer.IsKubeEnabled() {
+			// if kubernetes decoration is disabled, we just bypass the node
+			return pipe.Bypass[[]request.Span](), nil
+		}
+		decorator := &metadataDecorator{db: ctxInfo.AppO11y.K8sDatabase, clusterName: KubeClusterName(ctx, cfg)}
 		return decorator.nodeLoop, nil
 	}
 }
@@ -78,10 +66,12 @@ func KubeDecoratorProvider(
 // production implementer: kube.Database
 type kubeDatabase interface {
 	OwnerPodInfo(pidNamespace uint32) (*kube.PodInfo, bool)
+	HostNameForIP(ip string) string
 }
 
 type metadataDecorator struct {
-	db kubeDatabase
+	db          kubeDatabase
+	clusterName string
 }
 
 func (md *metadataDecorator) nodeLoop(in <-chan []request.Span, out chan<- []request.Span) {
@@ -98,28 +88,26 @@ func (md *metadataDecorator) nodeLoop(in <-chan []request.Span, out chan<- []req
 
 func (md *metadataDecorator) do(span *request.Span) {
 	if podInfo, ok := md.db.OwnerPodInfo(span.Pid.Namespace); ok {
-		appendMetadata(span, podInfo)
+		md.appendMetadata(span, podInfo)
 	} else {
 		// do not leave the service attributes map as nil
-		span.ServiceID.Metadata = map[string]string{}
+		span.ServiceID.Metadata = map[attr.Name]string{}
+	}
+	// override the peer and host names from Kubernetes metadata, if found
+	if hn := md.db.HostNameForIP(span.Host); hn != "" {
+		span.HostName = hn
+	}
+	if pn := md.db.HostNameForIP(span.Peer); pn != "" {
+		span.PeerName = pn
 	}
 }
 
-func appendMetadata(span *request.Span, info *kube.PodInfo) {
+func (md *metadataDecorator) appendMetadata(span *request.Span, info *kube.PodInfo) {
 	// If the user has not defined criteria values for the reported
 	// service name and namespace, we will automatically set it from
 	// the kubernetes metadata
 	if span.ServiceID.AutoName {
-		if info.Owner != nil {
-			// we have two levels of ownership at most
-			if info.Owner.Owner != nil {
-				span.ServiceID.Name = info.Owner.Owner.Name
-			} else {
-				span.ServiceID.Name = info.Owner.Name
-			}
-		} else {
-			span.ServiceID.Name = info.Name
-		}
+		span.ServiceID.Name = info.ServiceName()
 	}
 	if span.ServiceID.Namespace == "" {
 		span.ServiceID.Namespace = info.Namespace
@@ -128,16 +116,45 @@ func appendMetadata(span *request.Span, info *kube.PodInfo) {
 
 	// if, in the future, other pipeline steps modify the service metadata, we should
 	// replace the map literal by individual entry insertions
-	span.ServiceID.Metadata = map[string]string{
-		kube.NamespaceName: info.Namespace,
-		kube.PodName:       info.Name,
-		kube.NodeName:      info.NodeName,
-		kube.PodUID:        string(info.UID),
-		kube.PodStartTime:  info.StartTimeStr,
+	span.ServiceID.Metadata = map[attr.Name]string{
+		attr.K8sNamespaceName: info.Namespace,
+		attr.K8sPodName:       info.Name,
+		attr.K8sNodeName:      info.NodeName,
+		attr.K8sPodUID:        string(info.UID),
+		attr.K8sPodStartTime:  info.StartTimeStr,
+		attr.K8sClusterName:   md.clusterName,
 	}
 	owner := info.Owner
 	for owner != nil {
-		span.ServiceID.Metadata[owner.Type.LabelName()] = owner.Name
+		span.ServiceID.Metadata[attr.Name(owner.LabelName)] = owner.Name
 		owner = owner.Owner
 	}
+	// override hostname by the Pod name
+	span.ServiceID.HostName = info.Name
+}
+
+func KubeClusterName(ctx context.Context, cfg *KubernetesDecorator) string {
+	log := klog().With("func", "KubeClusterName")
+	if cfg.ClusterName != "" {
+		return cfg.ClusterName
+	}
+	retries := 0
+	for retries < clusterMetadataRetries {
+		if clusterName := fetchClusterName(ctx); clusterName != "" {
+			return clusterName
+		}
+		retries++
+		log.Debug("retrying cluster name fetching in 500 ms...")
+		select {
+		case <-ctx.Done():
+			log.Debug("context canceled before starting the kubernetes decorator node")
+			return ""
+		case <-time.After(clusterMetadataFailRetryTime):
+			// retry or end!
+		}
+	}
+	log.Warn("can't fetch Kubernetes Cluster Name." +
+		" Network metrics won't contain k8s.cluster.name attribute unless you explicitly set " +
+		" the BEYLA_KUBE_CLUSTER_NAME environment variable")
+	return ""
 }

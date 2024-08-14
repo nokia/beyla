@@ -55,12 +55,12 @@ func New(cfg *beyla.Config, metrics imetrics.Reporter) *Tracer {
 	}
 }
 
-func (p *Tracer) AllowPID(pid uint32, svc svc.ID) {
-	p.pidsFilter.AllowPID(pid, svc, ebpfcommon.PIDTypeGo)
+func (p *Tracer) AllowPID(pid, ns uint32, svc svc.ID) {
+	p.pidsFilter.AllowPID(pid, ns, svc, ebpfcommon.PIDTypeGo)
 }
 
-func (p *Tracer) BlockPID(pid uint32) {
-	p.pidsFilter.BlockPID(pid)
+func (p *Tracer) BlockPID(pid, ns uint32) {
+	p.pidsFilter.BlockPID(pid, ns)
 }
 
 func (p *Tracer) supportsContextPropagation() bool {
@@ -79,10 +79,13 @@ func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
 			loader = loadBpf_tp_debug
 		}
 	} else {
-		p.log.Info("Kernel in lockdown mode, trace info propagation in HTTP headers is disabled.")
+		p.log.Info("Kernel in lockdown mode or missing CAP_SYS_ADMIN," +
+			" trace info propagation in HTTP headers is disabled.")
 	}
 	return loader()
 }
+
+func (p *Tracer) SetupTailCalls() {}
 
 func (p *Tracer) Constants(_ *exec.FileInfo, offsets *goexec.Offsets) map[string]any {
 	// Set the field offsets and the logLevel for nethttp BPF program,
@@ -94,20 +97,18 @@ func (p *Tracer) Constants(_ *exec.FileInfo, offsets *goexec.Offsets) map[string
 		"url_ptr_pos",
 		"path_ptr_pos",
 		"method_ptr_pos",
-		"status_ptr_pos",
 		"status_code_ptr_pos",
-		"remoteaddr_ptr_pos",
-		"host_ptr_pos",
 		"content_length_ptr_pos",
-		"resp_req_pos",
 		"req_header_ptr_pos",
 		"io_writer_buf_ptr_pos",
 		"io_writer_n_pos",
 		"tcp_addr_port_ptr_pos",
 		"tcp_addr_ip_ptr_pos",
-		"c_rwc_pos",
 		"pc_conn_pos",
-		"rwc_conn_pos",
+		"pc_tls_pos",
+		"c_rwc_pos",
+		"c_tls_pos",
+		"net_conn_pos",
 		"conn_fd_pos",
 		"fd_laddr_pos",
 		"fd_raddr_pos",
@@ -117,10 +118,10 @@ func (p *Tracer) Constants(_ *exec.FileInfo, offsets *goexec.Offsets) map[string
 
 	// Optional list
 	for _, s := range []string{
-		"rws_req_pos",
-		"rws_status_pos",
 		"cc_next_stream_id_pos",
 		"framer_w_pos",
+		"cc_tconn_pos",
+		"sc_conn_pos",
 	} {
 		constants[s] = offsets.Field[s]
 		if constants[s] == nil {
@@ -146,18 +147,39 @@ func (p *Tracer) GoProbes() map[string]ebpfcommon.FunctionPrograms {
 			End:   p.bpfObjects.UprobeServeHTTPReturns,
 		},
 		"net/http.(*conn).readRequest": {
-			End: p.bpfObjects.UprobeReadRequestReturns,
+			Start: p.bpfObjects.UprobeReadRequestStart,
+			End:   p.bpfObjects.UprobeReadRequestReturns,
 		},
 		"net/http.(*Transport).roundTrip": { // HTTP client, works with Client.Do as well as using the RoundTripper directly
 			Start: p.bpfObjects.UprobeRoundTrip,
 			End:   p.bpfObjects.UprobeRoundTripReturn,
 		},
+		"golang.org/x/net/http2.(*ClientConn).roundTrip": { // http2 client after 0.22
+			Start: p.bpfObjects.UprobeHttp2RoundTrip,
+			End:   p.bpfObjects.UprobeRoundTripReturn, // return is the same as for http 1.1
+		},
 		"golang.org/x/net/http2.(*ClientConn).RoundTrip": { // http2 client
+			Start: p.bpfObjects.UprobeHttp2RoundTrip,
+			End:   p.bpfObjects.UprobeRoundTripReturn, // return is the same as for http 1.1
+		},
+		"net/http.(*http2ClientConn).RoundTrip": { // http2 client vendored in Go
 			Start: p.bpfObjects.UprobeHttp2RoundTrip,
 			End:   p.bpfObjects.UprobeRoundTripReturn, // return is the same as for http 1.1
 		},
 		"golang.org/x/net/http2.(*responseWriterState).writeHeader": { // http2 server request done, capture the response code
 			Start: p.bpfObjects.UprobeHttp2ResponseWriterStateWriteHeader,
+		},
+		"net/http.(*http2responseWriterState).writeHeader": { // same as above, vendored in go
+			Start: p.bpfObjects.UprobeHttp2ResponseWriterStateWriteHeader,
+		},
+		"net/http.(*response).WriteHeader": {
+			Start: p.bpfObjects.UprobeHttp2ResponseWriterStateWriteHeader, // http response code capture
+		},
+		"golang.org/x/net/http2.(*serverConn).runHandler": {
+			Start: p.bpfObjects.UprobeHttp2serverConnRunHandler, // http2 server connection tracking
+		},
+		"net/http.(*http2serverConn).runHandler": {
+			Start: p.bpfObjects.UprobeHttp2serverConnRunHandler, // http2 server connection tracking, vendored in go
 		},
 		// tracking of tcp connections for black-box propagation
 		"net/http.(*conn).serve": { // http server
@@ -173,7 +195,11 @@ func (p *Tracer) GoProbes() map[string]ebpfcommon.FunctionPrograms {
 		// sql
 		"database/sql.(*DB).queryDC": {
 			Start: p.bpfObjects.UprobeQueryDC,
-			End:   p.bpfObjects.UprobeQueryDCReturn,
+			End:   p.bpfObjects.UprobeQueryReturn,
+		},
+		"database/sql.(*DB).execDC": {
+			Start: p.bpfObjects.UprobeExecDC,
+			End:   p.bpfObjects.UprobeQueryReturn,
 		},
 	}
 
@@ -182,6 +208,10 @@ func (p *Tracer) GoProbes() map[string]ebpfcommon.FunctionPrograms {
 			Start: p.bpfObjects.UprobeWriteSubset, // http 1.x context propagation
 		}
 		m["golang.org/x/net/http2.(*Framer).WriteHeaders"] = ebpfcommon.FunctionPrograms{ // http2 context propagation
+			Start: p.bpfObjects.UprobeHttp2FramerWriteHeaders,
+			End:   p.bpfObjects.UprobeHttp2FramerWriteHeadersReturns,
+		}
+		m["net/http.(*http2Framer).WriteHeaders"] = ebpfcommon.FunctionPrograms{ // http2 context propagation
 			Start: p.bpfObjects.UprobeHttp2FramerWriteHeaders,
 			End:   p.bpfObjects.UprobeHttp2FramerWriteHeadersReturns,
 		}
@@ -218,31 +248,5 @@ func (p *Tracer) Run(ctx context.Context, eventsChan chan<- []request.Span) {
 		p.pidsFilter,
 		p.bpfObjects.Events,
 		p.metrics,
-		append(p.closers, &p.bpfObjects)...,
-	)(ctx, eventsChan)
-}
-
-// GinTracer overrides Tracer to inspect the Gin ServeHTTP endpoint
-type GinTracer struct {
-	Tracer
-}
-
-func (p *GinTracer) GoProbes() map[string]ebpfcommon.FunctionPrograms {
-	return map[string]ebpfcommon.FunctionPrograms{
-		"github.com/gin-gonic/gin.(*Engine).ServeHTTP": {
-			Required: true,
-			Start:    p.bpfObjects.UprobeServeHTTP,
-			End:      p.bpfObjects.UprobeServeHTTPReturns,
-		},
-	}
-}
-
-func (p *GinTracer) Run(ctx context.Context, eventsChan chan<- []request.Span) {
-	ebpfcommon.SharedRingbuf(
-		p.cfg,
-		p.pidsFilter,
-		p.bpfObjects.Events,
-		p.metrics,
-		append(p.closers, &p.bpfObjects)...,
-	)(ctx, eventsChan)
+	)(ctx, append(p.closers, &p.bpfObjects), eventsChan)
 }

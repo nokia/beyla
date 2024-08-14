@@ -69,7 +69,14 @@ test/integration/components/rubytestserver/testapi/tmp/storage/*
 !test/integration/components/rubytestserver/testapi/tmp/storage/
 !test/integration/components/rubytestserver/testapi/tmp/storage/.keep
 test/integration/components/dotnetserver/obj/*
-test/oats/build/*
+test/oats/*/build/*
 test/cmd/grpc/client/grpclient
 test/integration/components/gohttp2/client/client
 test/integration/components/gohttp2/server/http2srv
+beyla.sln
+test/integration/components/gokafka/gokafka
+test/integration/components/gokafka/vendor/*
+test/integration/components/gokafka-seg/vendor/*
+test/integration/components/gokafka-seg/gokafka
+test/integration/components/goredis/vendor/*
+test/integration/components/goredis/goredis

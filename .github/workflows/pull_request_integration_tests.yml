@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go: [ '1.21' ]
+        go: [ '1.22' ]
     steps:
       - uses: actions/checkout@v3
       - name: Set up Go
@@ -35,8 +35,9 @@ jobs:
             testoutput/*.log
             testoutput/kind
       - name: Report coverage
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:
-          files: ./testoutput/itest-covdata.txt
+          file: ./testoutput/itest-covdata.txt
           flags: integration-test
-          token: ${{ secrets.CODECOV_TOKEN }}

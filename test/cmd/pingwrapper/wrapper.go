@@ -79,7 +79,7 @@ func pingHandler(rw http.ResponseWriter, req *http.Request) {
 
 	requestURL := "http://localhost:8080/ping"
 	if delay > 0 {
-		requestURL = requestURL + fmt.Sprintf("?delay=%s", delay.String())
+		requestURL += fmt.Sprintf("?delay=%s", delay.String())
 	}
 
 	slog.Debug("calling", "url", requestURL)
@@ -110,7 +110,7 @@ func pingHandler(rw http.ResponseWriter, req *http.Request) {
 
 func gpingHandler(rw http.ResponseWriter, _ *http.Request) {
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	conn, err := grpc.Dial("localhost:5051", opts...)
+	conn, err := grpc.NewClient("localhost:5051", opts...)
 	if err != nil {
 		slog.Error("fail to dial", err)
 		os.Exit(-1)
@@ -126,6 +126,7 @@ func gpingHandler(rw http.ResponseWriter, _ *http.Request) {
 	feature, err := client.GetFeature(ctx, point)
 	if err != nil {
 		slog.Error("client.GetFeature failed", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	if slog.Default().Enabled(context.TODO(), slog.LevelDebug) {

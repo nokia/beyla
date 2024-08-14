@@ -23,7 +23,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/mariomac/pipes/pkg/node"
+	"github.com/mariomac/pipes/pipe"
 
 	"github.com/grafana/beyla/pkg/internal/netolly/ebpf"
 )
@@ -70,7 +70,11 @@ type entry struct {
 // the flows from the first interface coming to it, until that flow expires in the cache
 // (no activity for it during the expiration time)
 // After passing by the deduper, the ebpf.Record instances loose their IfIndex and Direction fields.
-func DeduperProvider(dd Deduper) (node.MiddleFunc[[]*ebpf.Record, []*ebpf.Record], error) {
+func DeduperProvider(dd *Deduper) (pipe.MiddleFunc[[]*ebpf.Record, []*ebpf.Record], error) {
+	if !dd.Enabled() {
+		// This node is not going to be instantiated. Let the pipes library just bypassing it.
+		return pipe.Bypass[[]*ebpf.Record](), nil
+	}
 	cache := &deduperCache{
 		expire:  dd.ExpireTime,
 		entries: list.New(),
@@ -87,9 +91,8 @@ func DeduperProvider(dd Deduper) (node.MiddleFunc[[]*ebpf.Record, []*ebpf.Record
 				// Before forwarding, unset the non-common fields of deduplicate flows.
 				// These values are not relevant after deduplication and keeping them
 				// would unnecessarily increase cardinality, as they could chaotically
-				// contain the different directions and interfaces.
+				// contain the different interfaces.
 				record.Id.IfIndex = ebpf.InterfaceUnset
-				record.Id.Direction = ebpf.DirectionUnset
 
 				fwd = append(fwd, record)
 			}
@@ -106,7 +109,6 @@ func (c *deduperCache) isDupe(key *ebpf.NetFlowId) bool {
 	rk := *key
 	// zeroes fields from key that should be ignored from the flow comparison
 	rk.IfIndex = 0
-	rk.Direction = 0
 	// If a flow has been accounted previously, whatever its interface was,
 	// it updates the expiry time for that flow
 	if ele, ok := c.ifaces[rk]; ok {

@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration_k8s
 
 package otel
 
@@ -33,7 +33,7 @@ func TestTracesDecoration(t *testing.T) {
 		Setup(pinger.Deploy()).
 		Teardown(pinger.Delete()).
 		Assess("all the traces are properly decorated",
-			func(ctx context.Context, t *testing.T, config *envconf.Config) context.Context {
+			func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 				var trace jaeger.Trace
 				var parent jaeger.Span
 				test.Eventually(t, testTimeout, func(t require.TestingT) {
@@ -62,6 +62,7 @@ func TestTracesDecoration(t *testing.T) {
 						{Key: "k8s.pod.start_time", Type: "string", Value: k8s.TimeRegex},
 						{Key: "k8s.namespace.name", Type: "string", Value: "^default$"},
 						{Key: "k8s.deployment.name", Type: "string", Value: "^testserver$"},
+						{Key: "k8s.cluster.name", Type: "string", Value: "^beyla$"},
 					}, trace.Processes[parent.ProcessID].Tags)
 					require.Empty(t, sd, sd.String())
 				}, test.Interval(100*time.Millisecond))

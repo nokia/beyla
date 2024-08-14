@@ -23,6 +23,11 @@ int BPF_UPROBE(uprobe_ssl_do_handshake, void *s) {
 
     bpf_dbg_printk("=== uprobe SSL_do_handshake=%d ssl=%llx===", id, s);
 
+    ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &s);
+    if (s_conn) {
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn, s);
+    }
+
     bpf_map_update_elem(&active_ssl_handshakes, &id, &s, BPF_ANY);
 
     return 0;
@@ -56,6 +61,11 @@ int BPF_UPROBE(uprobe_ssl_read, void *ssl, const void *buf, int num) {
 
     bpf_dbg_printk("=== uprobe SSL_read id=%d ssl=%llx ===", id, ssl);
 
+    ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &ssl);
+    if (s_conn) {
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn, ssl);
+    }
+
     ssl_args_t args = {};
     args.buf = (u64)buf;
     args.ssl = (u64)ssl;
@@ -79,8 +89,10 @@ int BPF_URETPROBE(uretprobe_ssl_read, int ret) {
 
     ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_read_args, &id);
 
-    handle_ssl_buf(id, args, ret, TCP_RECV);
     bpf_map_delete_elem(&active_ssl_read_args, &id);
+
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, args, ret, TCP_RECV);
     return 0;
 }
 
@@ -92,7 +104,12 @@ int BPF_UPROBE(uprobe_ssl_read_ex, void *ssl, const void *buf, int num, size_t *
         return 0;
     }
 
-    bpf_dbg_printk("=== SSL_read_ex id=%d ===", id);
+    bpf_dbg_printk("=== SSL_read_ex id=%d ssl=%llx ===", id, ssl);
+
+    ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &ssl);
+    if (s_conn) {
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn, ssl);
+    }
 
     ssl_args_t args = {};
     args.buf = (u64)buf;
@@ -101,7 +118,7 @@ int BPF_UPROBE(uprobe_ssl_read_ex, void *ssl, const void *buf, int num, size_t *
 
     bpf_map_update_elem(&active_ssl_read_args, &id, &args, BPF_ANY);
     bpf_map_update_elem(&ssl_to_pid_tid, &args.ssl, &id, BPF_NOEXIST); // we must not overwrite here, remember the original thread
-    
+
     return 0;
 }
 
@@ -118,15 +135,16 @@ int BPF_URETPROBE(uretprobe_ssl_read_ex, int ret) {
     ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_read_args, &id);
 
     if (ret != 1 || !args || !args->len_ptr) {
-        goto done;
+        bpf_map_delete_elem(&active_ssl_read_args, &id);
+        return 0;
     }
 
     size_t read_len = 0;
     bpf_probe_read(&read_len, sizeof(read_len), (void *)args->len_ptr);
 
-    handle_ssl_buf(id, args, read_len, TCP_RECV);
-done:
     bpf_map_delete_elem(&active_ssl_read_args, &id);
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, args, read_len, TCP_RECV);
     return 0;
 }
 
@@ -146,10 +164,11 @@ int BPF_UPROBE(uprobe_ssl_write, void *ssl, const void *buf, int num) {
     ssl_args_t args = {};
     args.buf = (u64)buf;
     args.ssl = (u64)ssl;
-    args.len_ptr = 0;
 
     bpf_map_update_elem(&active_ssl_write_args, &id, &args, BPF_ANY);
 
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, &args, num, TCP_SEND);
     return 0;
 }
 
@@ -163,10 +182,8 @@ int BPF_URETPROBE(uretprobe_ssl_write, int ret) {
 
     bpf_dbg_printk("=== uretprobe SSL_write id=%d ===", id);
 
-    ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
-
-    handle_ssl_buf(id, args, ret, TCP_SEND);
     bpf_map_delete_elem(&active_ssl_write_args, &id);
+
     return 0;
 }
 
@@ -178,14 +195,16 @@ int BPF_UPROBE(uprobe_ssl_write_ex, void *ssl, const void *buf, int num, size_t 
         return 0;
     }
 
-    bpf_dbg_printk("=== SSL_write_ex id=%d ===", id);
+    bpf_dbg_printk("=== SSL_write_ex id=%d ssl=%llx ===", id, ssl);
 
     ssl_args_t args = {};
     args.buf = (u64)buf;
     args.ssl = (u64)ssl;
-    args.len_ptr = (u64)written;
 
     bpf_map_update_elem(&active_ssl_write_args, &id, &args, BPF_ANY);
+
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, &args, num, TCP_SEND);
 
     return 0;
 }
@@ -200,18 +219,8 @@ int BPF_URETPROBE(uretprobe_ssl_write_ex, int ret) {
 
     bpf_dbg_printk("=== uretprobe SSL_write_ex id=%d ===", id);
 
-    ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
-
-    if (ret != 1 || !args || !args->len_ptr) {
-        goto done;
-    }
-
-    size_t wrote_len = 0;
-    bpf_probe_read(&wrote_len, sizeof(wrote_len), (void *)args->len_ptr);
-
-    handle_ssl_buf(id, args, wrote_len, TCP_SEND);
-done:
     bpf_map_delete_elem(&active_ssl_write_args, &id);
+
     return 0;
 }
 
@@ -225,7 +234,15 @@ int BPF_UPROBE(uprobe_ssl_shutdown, void *s) {
 
     bpf_dbg_printk("=== SSL_shutdown id=%d ssl=%llx ===", id, s);
 
+    ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &s);
+    if (s_conn) {
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn, s);
+        bpf_map_delete_elem(&active_ssl_connections, &s_conn->p_conn);
+    }
+
     bpf_map_delete_elem(&ssl_to_conn, &s);
+    bpf_map_delete_elem(&ssl_to_pid_tid, &s);
+
     bpf_map_delete_elem(&pid_tid_to_conn, &id);
 
     return 0;

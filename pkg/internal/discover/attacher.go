@@ -2,18 +2,17 @@ package discover
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"path"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/mariomac/pipes/pkg/node"
+	"github.com/mariomac/pipes/pipe"
 
 	"github.com/grafana/beyla/pkg/beyla"
 	"github.com/grafana/beyla/pkg/internal/ebpf"
 	"github.com/grafana/beyla/pkg/internal/goexec"
-	"github.com/grafana/beyla/pkg/internal/helpers"
+	"github.com/grafana/beyla/pkg/internal/helpers/maps"
 	"github.com/grafana/beyla/pkg/internal/imetrics"
 	"github.com/grafana/beyla/pkg/internal/svc"
 )
@@ -29,22 +28,27 @@ type TraceAttacher struct {
 	DeleteTracers     chan *Instrumentable
 	Metrics           imetrics.Reporter
 	pinPath           string
+	beylaPID          int
 
 	// processInstances keeps track of the instances of each process. This will help making sure
 	// that we don't remove the BPF resources of an executable until all their instances are removed
 	// are stopped
-	processInstances helpers.MultiCounter[uint64]
+	processInstances maps.MultiCounter[uint64]
 
 	// keeps a copy of all the tracers for a given executable path
 	existingTracers map[uint64]*ebpf.ProcessTracer
 	reusableTracer  *ebpf.ProcessTracer
 }
 
-//nolint:gocritic
-func TraceAttacherProvider(ta TraceAttacher) (node.TerminalFunc[[]Event[Instrumentable]], error) {
+func TraceAttacherProvider(ta *TraceAttacher) pipe.FinalProvider[[]Event[Instrumentable]] {
+	return ta.attacherLoop
+}
+
+func (ta *TraceAttacher) attacherLoop() (pipe.FinalFunc[[]Event[Instrumentable]], error) {
 	ta.log = slog.With("component", "discover.TraceAttacher")
 	ta.existingTracers = map[uint64]*ebpf.ProcessTracer{}
-	ta.processInstances = helpers.MultiCounter[uint64]{}
+	ta.processInstances = maps.MultiCounter[uint64]{}
+	ta.beylaPID = os.Getpid()
 	ta.pinPath = BuildPinPath(ta.Cfg)
 
 	if err := ta.init(); err != nil {
@@ -78,6 +82,10 @@ func TraceAttacherProvider(ta TraceAttacher) (node.TerminalFunc[[]Event[Instrume
 	}, nil
 }
 
+func (ta *TraceAttacher) skipSelfInstrumentation(ie *Instrumentable) bool {
+	return ie.FileInfo.Pid == int32(ta.beylaPID) && !ta.Cfg.Discovery.AllowSelfInstrumentation
+}
+
 //nolint:cyclop
 func (ta *TraceAttacher) getTracer(ie *Instrumentable) (*ebpf.ProcessTracer, bool) {
 	if tracer, ok := ta.existingTracers[ie.FileInfo.Ino]; ok {
@@ -88,13 +96,21 @@ func (ta *TraceAttacher) getTracer(ie *Instrumentable) (*ebpf.ProcessTracer, boo
 		ie.FileInfo.Service.SDKLanguage = ie.Type
 		// allowing the tracer to forward traces from the new PID and its children processes
 		monitorPIDs(tracer, ie)
+		ta.Metrics.InstrumentProcess(ie.FileInfo.ExecutableName())
 		if tracer.Type == ebpf.Generic {
 			monitorPIDs(ta.reusableTracer, ie)
 		}
 		ta.log.Debug(".done")
 		return nil, false
 	}
+
+	if ta.skipSelfInstrumentation(ie) {
+		ta.log.Info("skipping self-instrumentation of Beyla process", "cmd", ie.FileInfo.CmdExePath, "pid", ie.FileInfo.Pid)
+		return nil, false
+	}
+
 	ta.log.Info("instrumenting process", "cmd", ie.FileInfo.CmdExePath, "pid", ie.FileInfo.Pid)
+	ta.Metrics.InstrumentProcess(ie.FileInfo.ExecutableName())
 
 	// builds a tracer for that executable
 	var programs []ebpf.Tracer
@@ -116,14 +132,11 @@ func (ta *TraceAttacher) getTracer(ie *Instrumentable) (*ebpf.ProcessTracer, boo
 			tracerType = ebpf.Go
 			programs = filterNotFoundPrograms(newGoTracersGroup(ta.Cfg, ta.Metrics), ie.Offsets)
 		}
-	case svc.InstrumentableJava, svc.InstrumentableNodejs, svc.InstrumentableRuby, svc.InstrumentablePython, svc.InstrumentableDotnet, svc.InstrumentableGeneric, svc.InstrumentableRust:
-		// We are not instrumenting a Go application, we override the programs
-		// list with the generic kernel/socket space filters
-		if ta.reusableTracer != nil {
-			programs = newNonGoTracersGroupUProbes(ta.Cfg, ta.Metrics)
-		} else {
-			programs = newNonGoTracersGroup(ta.Cfg, ta.Metrics)
-		}
+	case svc.InstrumentableNodejs:
+		programs = ta.genericTracers()
+		programs = append(programs, newNodeJSTracersGroup(ta.Cfg, ta.Metrics)...)
+	case svc.InstrumentableJava, svc.InstrumentableRuby, svc.InstrumentablePython, svc.InstrumentableDotnet, svc.InstrumentableGeneric, svc.InstrumentableRust, svc.InstrumentablePHP:
+		programs = ta.genericTracers()
 	default:
 		ta.log.Warn("unexpected instrumentable type. This is basically a bug", "type", ie.Type)
 	}
@@ -170,6 +183,14 @@ func (ta *TraceAttacher) getTracer(ie *Instrumentable) (*ebpf.ProcessTracer, boo
 	return tracer, true
 }
 
+func (ta *TraceAttacher) genericTracers() []ebpf.Tracer {
+	if ta.reusableTracer != nil {
+		return newNonGoTracersGroupUProbes(ta.Cfg, ta.Metrics)
+	}
+
+	return newNonGoTracersGroup(ta.Cfg, ta.Metrics)
+}
+
 func monitorPIDs(tracer *ebpf.ProcessTracer, ie *Instrumentable) {
 	// If the user does not override the service name via configuration
 	// the service name is the name of the found executable
@@ -183,9 +204,9 @@ func monitorPIDs(tracer *ebpf.ProcessTracer, ie *Instrumentable) {
 	}
 
 	// allowing the tracer to forward traces from the discovered PID and its children processes
-	tracer.AllowPID(uint32(ie.FileInfo.Pid), ie.FileInfo.Service)
+	tracer.AllowPID(uint32(ie.FileInfo.Pid), ie.FileInfo.Ns, ie.FileInfo.Service)
 	for _, pid := range ie.ChildPids {
-		tracer.AllowPID(pid, ie.FileInfo.Service)
+		tracer.AllowPID(pid, ie.FileInfo.Ns, ie.FileInfo.Service)
 	}
 }
 
@@ -193,7 +214,7 @@ func monitorPIDs(tracer *ebpf.ProcessTracer, ie *Instrumentable) {
 // it will be:
 //   - current beyla PID
 func BuildPinPath(cfg *beyla.Config) string {
-	return path.Join(cfg.EBPF.BpfBaseDir, fmt.Sprintf("beyla-%d", os.Getpid()))
+	return path.Join(cfg.EBPF.BpfBaseDir, cfg.EBPF.BpfPath)
 }
 
 func (ta *TraceAttacher) notifyProcessDeletion(ie *Instrumentable) {
@@ -204,7 +225,8 @@ func (ta *TraceAttacher) notifyProcessDeletion(ie *Instrumentable) {
 		// notifying the tracer to block any trace from that PID
 		// to avoid that a new process reusing this PID could send traces
 		// unless explicitly allowed
-		tracer.BlockPID(uint32(ie.FileInfo.Pid))
+		ta.Metrics.UninstrumentProcess(ie.FileInfo.ExecutableName())
+		tracer.BlockPID(uint32(ie.FileInfo.Pid), ie.FileInfo.Ns)
 
 		// if there are no more trace instances for a Go program, we need to notify that
 		// the tracer needs to be stopped and deleted.

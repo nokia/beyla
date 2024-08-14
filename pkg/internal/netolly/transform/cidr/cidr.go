@@ -5,15 +5,11 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/mariomac/pipes/pkg/node"
+	"github.com/mariomac/pipes/pipe"
 	"github.com/yl2chen/cidranger"
 
+	attr "github.com/grafana/beyla/pkg/export/attributes/names"
 	"github.com/grafana/beyla/pkg/internal/netolly/ebpf"
-)
-
-const (
-	attrSrcCIDR = "src.cidr"
-	attrDstCIDR = "dst.cidr"
 )
 
 func glog() *slog.Logger {
@@ -32,7 +28,11 @@ type ipGrouper struct {
 	ranger cidranger.Ranger
 }
 
-func DecoratorProvider(g Definitions) (node.MiddleFunc[[]*ebpf.Record, []*ebpf.Record], error) {
+func DecoratorProvider(g Definitions) (pipe.MiddleFunc[[]*ebpf.Record, []*ebpf.Record], error) {
+	if !g.Enabled() {
+		// This node is not going to be instantiated. Let the pipes library just bypassing it.
+		return pipe.Bypass[[]*ebpf.Record](), nil
+	}
 	grouper, err := newIPGrouper(g)
 	if err != nil {
 		return nil, fmt.Errorf("instantiating IP grouper: %w", err)
@@ -83,12 +83,12 @@ func (g *ipGrouper) CIDR(ip net.IP) string {
 
 func (g *ipGrouper) decorate(flow *ebpf.Record) {
 	if flow.Attrs.Metadata == nil {
-		flow.Attrs.Metadata = map[string]string{}
+		flow.Attrs.Metadata = map[attr.Name]string{}
 	}
 	if srcCIDR := g.CIDR(flow.Id.SrcIP().IP()); srcCIDR != "" {
-		flow.Attrs.Metadata[attrSrcCIDR] = srcCIDR
+		flow.Attrs.Metadata[attr.SrcCIDR] = srcCIDR
 	}
 	if dstCIDR := g.CIDR(flow.Id.DstIP().IP()); dstCIDR != "" {
-		flow.Attrs.Metadata[attrDstCIDR] = dstCIDR
+		flow.Attrs.Metadata[attr.DstCIDR] = dstCIDR
 	}
 }

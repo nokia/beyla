@@ -6,6 +6,8 @@ import (
 
 	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
+
+	"github.com/grafana/beyla/pkg/internal/helpers"
 )
 
 func (ta *TraceAttacher) close() {
@@ -24,7 +26,7 @@ func (ta *TraceAttacher) mountBpfPinPath() error {
 		}
 	}
 
-	return bpfMount(ta.pinPath)
+	return ta.bpfMount(ta.pinPath)
 }
 
 func (ta *TraceAttacher) unmountBpfPinPath() {
@@ -40,8 +42,26 @@ func (ta *TraceAttacher) unmountBpfPinPath() {
 	}
 }
 
-func bpfMount(pinPath string) error {
-	return unix.Mount(pinPath, pinPath, "bpf", 0, "")
+func (ta *TraceAttacher) bpfMount(pinPath string) error {
+	mounted, bpffsInstance, err := IsMountFS(FilesystemTypeBPFFS, pinPath)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		caps, err := helpers.GetCurrentProcCapabilities()
+
+		if err == nil && !caps.Has(unix.CAP_SYS_ADMIN) {
+			return fmt.Errorf("beyla requires CAP_SYS_ADMIN in order to mount %s", pinPath)
+		}
+
+		return unix.Mount(pinPath, pinPath, "bpf", 0, "")
+	}
+	if !bpffsInstance {
+		return fmt.Errorf("mount in the custom directory %s has a different filesystem than BPFFS", pinPath)
+	}
+	ta.log.Info(fmt.Sprintf("Detected mounted BPF filesystem at %v", pinPath))
+
+	return nil
 }
 
 func (ta *TraceAttacher) init() error {

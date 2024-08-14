@@ -221,12 +221,12 @@ kind: ClusterRole
 metadata:
   name: beyla
 rules:
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["list", "watch"]
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets" ]
+    verbs: [ "list", "watch" ]
+  - apiGroups: [ "" ]
+    resources: [ "pods", "services", "nodes" ]
+    verbs: [ "list", "watch" ]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -296,7 +296,7 @@ spec:
       hostPID: true # mandatory!
       containers:
         - name: beyla
-          image: grafana/beyla:1.2
+          image: grafana/beyla:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true # mandatory!

@@ -6,8 +6,6 @@ Open source zero-code automatic instrumentation with eBPF and OpenTelemetry.
 
 [![Build Status](https://drone.grafana.net/api/badges/grafana/beyla/status.svg?ref=refs/heads/main)](https://drone.grafana.net/grafana/beyla)
 
-:green_circle: **We are hiring!** :green_circle: If you want to become a Beyla engineer, find our job post [here](https://boards.greenhouse.io/grafanalabs/jobs/5019971004).
-
 ## Introduction
 
 Beyla is a vendor agnostic, eBPF-based, OpenTelemetry/Prometheus application auto-instrumentation tool, which lets you easily get started with Application Observability. 
@@ -69,22 +67,38 @@ See [Documentation](https://grafana.com/docs/beyla/) and the [tutorials](https:/
   You can check if your kernel has BTF enabled by verifying if `/sys/kernel/btf/vmlinux` exists on your system.
   If you need to recompile your kernel to enable BTF, the configuration option `CONFIG_DEBUG_INFO_BTF=y` must be
   set. 
-- eBPF enabled in the host
+- eBPF enabled on the host
 - For instrumenting Go programs, they must have been compiled with at least Go 1.17. We currently
   support Go applications built with a major **Go version no earlier than 3 versions** behind the current
   stable major release.  
-- Administrative access to execute the instrumenter
-    - Or execute it from a user enabling the `SYS_ADMIN` capability. This might not work in some
-      container environments.
+- Some level of elevated permissions to execute the instrumenter:
+    - On host systems, running Beyla requires `sudo`.
+    - For Kubernetes we have detailed configuration example on how to run with minimum
+      required capabilities in the [examples/k8s/unprivileged.yaml](./examples/k8s/unprivileged.yaml) file.
+    - For docker compose, you need to setup Beyla as `privileged` container or grand the `SYS_ADMIN` capability.
 
-| Library                                       | Working  |
-|-----------------------------------------------|----------|
-| Kernel-level HTTP calls                       | ✅       |
-| OpenSSL library                               | ✅       |
-| Standard Go `net/http`                        | ✅       |
-| [Gorilla Mux](https://github.com/gorilla/mux) | ✅       |
-| [Gin](https://gin-gonic.com/)                 | ✅       |
-| [gRPC-Go](https://github.com/grpc/grpc-go)    | ✅       |
+| Available Instrumentations                    | Supported  |
+|-----------------------------------------------|------------|
+| HTTP/HTTPS/HTTP2                              | ✅         |
+| gRPC                                          | ✅         |
+| SQL                                           | ✅         |
+| Redis                                         | ✅         |
+| Kafka                                         | ✅         |
+
+The Go instrumentation is limited to certain specific libraries.
+
+| Available Go Instrumentations                       | Supported  |
+|-----------------------------------------------------|------------|
+| Standard Go `net/http`                              | ✅         |
+| [Gorilla Mux](https://github.com/gorilla/mux)       | ✅         |
+| [Gin](https://gin-gonic.com/)                       | ✅         |
+| [gRPC-Go](https://github.com/grpc/grpc-go)          | ✅         |
+| [Go x/net/http2](https://golang.org/x/net/http2)    | ✅         |
+| [Go-Redis v9](github.com/redis/go-redis)            | ✅         |
+| [Sarama Kafka](github.com/IBM/sarama)               | ✅         |
+| [kafka-Go](https://github.com/segmentio/kafka-go)   | ✅         |
+
+HTTPS instrumentation is limited to Go programs and libraries/languages using libssl3.
 
 ## Kubernetes
 

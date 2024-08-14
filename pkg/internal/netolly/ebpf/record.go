@@ -22,6 +22,8 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+
+	attr "github.com/grafana/beyla/pkg/export/attributes/names"
 )
 
 // IPAddr encodes v4 and v6 IPs with a fixed length.
@@ -32,6 +34,8 @@ type IPAddr [net.IPv6len]uint8
 
 // Record contains accumulated metrics from a flow, with extra metadata
 // that is added from the user space
+// REMINDER: any attribute here must be also added to the functions RecordGetters
+// and getDefinitions in pkg/internal/export/metric/definitions.go
 type Record struct {
 	NetFlowRecordT
 
@@ -50,7 +54,7 @@ type RecordAttrs struct {
 	Interface string
 	// BeylaIP provides information about the source of the flow (the Agent that traced it)
 	BeylaIP  string
-	Metadata map[string]string
+	Metadata map[attr.Name]string
 }
 
 func NewRecord(
@@ -69,6 +73,9 @@ func (fm *NetFlowMetrics) Accumulate(src *NetFlowMetrics) {
 	// time == 0 if the value has not been yet set
 	if fm.StartMonoTimeNs == 0 || fm.StartMonoTimeNs > src.StartMonoTimeNs {
 		fm.StartMonoTimeNs = src.StartMonoTimeNs
+		// set IfaceDirection here, because the correct value is in the first packet only
+		fm.IfaceDirection = src.IfaceDirection
+		fm.Initiator = src.Initiator
 	}
 	if fm.EndMonoTimeNs == 0 || fm.EndMonoTimeNs < src.EndMonoTimeNs {
 		fm.EndMonoTimeNs = src.EndMonoTimeNs

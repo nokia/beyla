@@ -36,8 +36,6 @@ var structMembers = map[string]structInfo{
 		fields: map[string]string{
 			"URL":           "url_ptr_pos",
 			"Method":        "method_ptr_pos",
-			"RemoteAddr":    "remoteaddr_ptr_pos",
-			"Host":          "host_ptr_pos",
 			"ContentLength": "content_length_ptr_pos",
 			"Header":        "req_header_ptr_pos",
 		},
@@ -46,13 +44,6 @@ var structMembers = map[string]structInfo{
 		lib: "go",
 		fields: map[string]string{
 			"Path": "path_ptr_pos",
-		},
-	},
-	"net/http.response": {
-		lib: "go",
-		fields: map[string]string{
-			"status": "status_ptr_pos",
-			"req":    "resp_req_pos",
 		},
 	},
 	"net/http.Response": {
@@ -75,13 +66,6 @@ var structMembers = map[string]structInfo{
 			"s": "grpc_status_s_pos",
 		},
 	},
-	"google.golang.org/grpc/peer.Peer": {
-		lib: "google.golang.org/grpc",
-		fields: map[string]string{
-			"Addr":      "grpc_peer_addr_pos",
-			"LocalAddr": "grpc_peer_localaddr_pos",
-		},
-	},
 	"google.golang.org/genproto/googleapis/rpc/status.Status": {
 		lib: "google.golang.org/genproto",
 		fields: map[string]string{
@@ -91,9 +75,7 @@ var structMembers = map[string]structInfo{
 	"google.golang.org/grpc/internal/transport.http2Server": {
 		lib: "google.golang.org/grpc",
 		fields: map[string]string{
-			"remoteAddr": "grpc_st_remoteaddr_ptr_pos",
-			"localAddr":  "grpc_st_localaddr_ptr_pos",
-			"peer":       "grpc_st_peer_ptr_pos",
+			"conn": "grpc_st_conn_pos",
 		},
 	},
 	"net.TCPAddr": {
@@ -101,12 +83,6 @@ var structMembers = map[string]structInfo{
 		fields: map[string]string{
 			"IP":   "tcp_addr_ip_ptr_pos",
 			"Port": "tcp_addr_port_ptr_pos",
-		},
-	},
-	"google.golang.org/grpc.ClientConn": {
-		lib: "google.golang.org/grpc",
-		fields: map[string]string{
-			"target": "grpc_client_target_ptr_pos",
 		},
 	},
 	"bufio.Writer": {
@@ -126,19 +102,15 @@ var structMembers = map[string]structInfo{
 		lib: "google.golang.org/grpc",
 		fields: map[string]string{
 			"nextID": "http2_client_next_id_pos",
-		},
-	},
-	"golang.org/x/net/http2.responseWriterState": {
-		lib: "golang.org/x/net",
-		fields: map[string]string{
-			"req":    "rws_req_pos",
-			"status": "rws_status_pos",
+			"conn":   "grpc_t_conn_pos",
+			"scheme": "grpc_t_scheme_pos",
 		},
 	},
 	"golang.org/x/net/http2.ClientConn": {
 		lib: "golang.org/x/net",
 		fields: map[string]string{
 			"nextStreamID": "cc_next_stream_id_pos",
+			"tconn":        "cc_tconn_pos",
 		},
 	},
 	"golang.org/x/net/http2.Framer": {
@@ -147,16 +119,16 @@ var structMembers = map[string]structInfo{
 			"w": "framer_w_pos",
 		},
 	},
-	"net/http.conn": {
-		lib: "go",
+	"golang.org/x/net/http2.serverConn": {
+		lib: "golang.org/x/net",
 		fields: map[string]string{
-			"rwc": "c_rwc_pos",
+			"conn": "sc_conn_pos",
 		},
 	},
 	"net.TCPConn": {
 		lib: "go",
 		fields: map[string]string{
-			"conn": "rwc_conn_pos",
+			"conn": "net_conn_pos",
 		},
 	},
 	"net.conn": {
@@ -175,7 +147,15 @@ var structMembers = map[string]structInfo{
 	"net/http.persistConn": {
 		lib: "go",
 		fields: map[string]string{
-			"conn": "pc_conn_pos",
+			"conn":     "pc_conn_pos",
+			"tlsState": "pc_tls_pos",
+		},
+	},
+	"net/http.conn": {
+		lib: "go",
+		fields: map[string]string{
+			"rwc":      "c_rwc_pos",
+			"tlsState": "c_tls_pos",
 		},
 	},
 	"google.golang.org/grpc/internal/transport.bufWriter": {
@@ -183,6 +163,70 @@ var structMembers = map[string]structInfo{
 		fields: map[string]string{
 			"buf":    "grpc_transport_buf_writer_buf_pos",
 			"offset": "grpc_transport_buf_writer_offset_pos",
+		},
+	},
+	"github.com/IBM/sarama.Broker": {
+		lib: "github.com/IBM/sarama",
+		fields: map[string]string{
+			"correlationID": "sarama_broker_corr_id_pos",
+			"conn":          "sarama_broker_conn_pos",
+		},
+	},
+	"github.com/IBM/sarama.responsePromise": {
+		lib: "github.com/IBM/sarama",
+		fields: map[string]string{
+			"correlationID": "sarama_response_corr_id_pos",
+		},
+	},
+	"github.com/IBM/sarama.bufConn": {
+		lib: "github.com/IBM/sarama",
+		fields: map[string]string{
+			"Conn": "sarama_bufconn_conn_pos",
+		},
+	},
+	// These are duplicate because the Sarama library changed orgs,
+	// from Shopify to IBM at version 1.40
+	"github.com/Shopify/sarama.Broker": {
+		lib: "github.com/IBM/sarama",
+		fields: map[string]string{
+			"correlationID": "sarama_broker_corr_id_pos",
+			"conn":          "sarama_broker_conn_pos",
+		},
+	},
+	"github.com/Shopify/sarama.responsePromise": {
+		lib: "github.com/IBM/sarama",
+		fields: map[string]string{
+			"correlationID": "sarama_response_corr_id_pos",
+		},
+	},
+	"github.com/Shopify/sarama.bufConn": {
+		lib: "github.com/IBM/sarama",
+		fields: map[string]string{
+			"Conn": "sarama_bufconn_conn_pos",
+		},
+	},
+	"github.com/redis/go-redis/v9/internal/pool.Conn": {
+		lib: "github.com/redis/go-redis/v9",
+		fields: map[string]string{
+			"bw": "redis_conn_bw_pos",
+		},
+	},
+	"github.com/segmentio/kafka-go.Writer": {
+		lib: "github.com/segmentio/kafka-go",
+		fields: map[string]string{
+			"Topic": "kafka_go_writer_topic_pos",
+		},
+	},
+	"github.com/segmentio/kafka-go/protocol.Conn": {
+		lib: "github.com/segmentio/kafka-go",
+		fields: map[string]string{
+			"conn": "kafka_go_protocol_conn_pos",
+		},
+	},
+	"github.com/segmentio/kafka-go.reader": {
+		lib: "github.com/segmentio/kafka-go",
+		fields: map[string]string{
+			"topic": "kafka_go_reader_topic_pos",
 		},
 	},
 }

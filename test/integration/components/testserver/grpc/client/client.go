@@ -58,18 +58,20 @@ func WithSSL() PingOption {
 }
 
 // printFeature gets the feature for the given point.
-func printFeature(client pb.RouteGuideClient, point *pb.Point) {
+func printFeature(ctx context.Context, client pb.RouteGuideClient, point *pb.Point) error {
 	slog.Debug("Getting feature for point", "lat", point.Latitude, "long", point.Longitude)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	feature, err := client.GetFeature(ctx, point)
 	if err != nil {
 		logs.Error("client.GetFeature failed", err)
-		os.Exit(-1)
+		// nolint:gocritic
+		return err
 	}
-	if slog.Default().Enabled(context.TODO(), slog.LevelDebug) {
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
 		log.Println(feature)
 	}
+	return nil
 }
 
 func newClient(po *pingOpts) (pb.RouteGuideClient, io.Closer, error) {
@@ -84,7 +86,7 @@ func newClient(po *pingOpts) (pb.RouteGuideClient, io.Closer, error) {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	conn, err := grpc.Dial(po.serverAddr, opts...)
+	conn, err := grpc.NewClient(po.serverAddr, opts...)
 	if err != nil {
 		logs.Error("fail to dial", err)
 		return nil, conn, err
@@ -93,14 +95,18 @@ func newClient(po *pingOpts) (pb.RouteGuideClient, io.Closer, error) {
 }
 
 func Ping(opts ...PingOption) error {
+	return PingCtx(context.Background(), opts...)
+}
+
+func PingCtx(ctx context.Context, opts ...PingOption) error {
 	client, closer, err := newClient(pingConfig(opts))
 	defer closer.Close()
 	if err != nil {
 		return err
 	}
 	// Looking for a valid feature
-	printFeature(client, &pb.Point{Latitude: 409146138, Longitude: -746188906})
-	return nil
+	err = printFeature(ctx, client, &pb.Point{Latitude: 409146138, Longitude: -746188906})
+	return err
 }
 
 func Debug(processTime time.Duration, forceFail bool, opts ...PingOption) error {
@@ -146,6 +152,7 @@ func printFeatures(client pb.RouteGuideClient, rect *pb.Rectangle) {
 	stream, err := client.ListFeatures(ctx, rect)
 	if err != nil {
 		slog.Error("client.ListFeatures failed", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	for {

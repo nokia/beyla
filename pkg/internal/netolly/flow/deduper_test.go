@@ -35,28 +35,28 @@ var oneIf1, oneIf2, twoIf1, twoIf2 *ebpf.Record
 func init() {
 	// oneIf1 and oneIf2 represent the same flow from 2 different interfaces
 	oneIf1 = &ebpf.Record{NetFlowRecordT: ebpf.NetFlowRecordT{Id: ebpf.NetFlowId{
-		EthProtocol: 1, Direction: 1, SrcPort: 123, DstPort: 456, IfIndex: 1,
+		EthProtocol: 1, SrcPort: 123, DstPort: 456, IfIndex: 1,
 	}, Metrics: ebpf.NetFlowMetrics{
-		Packets: 2, Bytes: 456, Flags: 1,
+		Packets: 2, Bytes: 456, Flags: 1, IfaceDirection: 1,
 	}}, Attrs: ebpf.RecordAttrs{Interface: "eth0"}}
 
 	oneIf2 = &ebpf.Record{NetFlowRecordT: ebpf.NetFlowRecordT{Id: ebpf.NetFlowId{
-		EthProtocol: 1, Direction: 1, SrcPort: 123, DstPort: 456, IfIndex: 2,
+		EthProtocol: 1, SrcPort: 123, DstPort: 456, IfIndex: 2,
 	}, Metrics: ebpf.NetFlowMetrics{
-		Packets: 2, Bytes: 456, Flags: 1,
+		Packets: 2, Bytes: 456, Flags: 1, IfaceDirection: 1,
 	}}, Attrs: ebpf.RecordAttrs{Interface: "123456789"}}
 
-	// twoIf1 and twoIf2 are another fow from 2 different interfaces and directions
+	// twoIf1 and twoIf2 are another flow from 2 different interfaces
 	twoIf1 = &ebpf.Record{NetFlowRecordT: ebpf.NetFlowRecordT{Id: ebpf.NetFlowId{
-		EthProtocol: 1, Direction: 1, SrcPort: 333, DstPort: 456, IfIndex: 1,
+		EthProtocol: 1, SrcPort: 333, DstPort: 456, IfIndex: 1,
 	}, Metrics: ebpf.NetFlowMetrics{
-		Packets: 2, Bytes: 456, Flags: 1,
+		Packets: 2, Bytes: 456, Flags: 1, IfaceDirection: 0,
 	}}, Attrs: ebpf.RecordAttrs{Interface: "eth0"}}
 
 	twoIf2 = &ebpf.Record{NetFlowRecordT: ebpf.NetFlowRecordT{Id: ebpf.NetFlowId{
-		EthProtocol: 1, Direction: 0, SrcPort: 333, DstPort: 456, IfIndex: 2,
+		EthProtocol: 1, SrcPort: 333, DstPort: 456, IfIndex: 2,
 	}, Metrics: ebpf.NetFlowMetrics{
-		Packets: 2, Bytes: 456, Flags: 1,
+		Packets: 2, Bytes: 456, Flags: 1, IfaceDirection: 0,
 	}}, Attrs: ebpf.RecordAttrs{Interface: "123456789"}}
 }
 
@@ -64,7 +64,7 @@ func TestDedupe(t *testing.T) {
 	input := make(chan []*ebpf.Record, 100)
 	output := make(chan []*ebpf.Record, 100)
 
-	dedupe, err := DeduperProvider(Deduper{Type: DeduperFirstCome, ExpireTime: time.Minute})
+	dedupe, err := DeduperProvider(&Deduper{Type: DeduperFirstCome, ExpireTime: time.Minute})
 	require.NoError(t, err)
 	go dedupe(input, output)
 
@@ -92,7 +92,7 @@ func TestDedupe_EvictFlows(t *testing.T) {
 	input := make(chan []*ebpf.Record, 100)
 	output := make(chan []*ebpf.Record, 100)
 
-	dedupe, err := DeduperProvider(Deduper{Type: DeduperFirstCome, ExpireTime: 15 * time.Second})
+	dedupe, err := DeduperProvider(&Deduper{Type: DeduperFirstCome, ExpireTime: 15 * time.Second})
 	require.NoError(t, err)
 	go dedupe(input, output)
 
@@ -151,7 +151,6 @@ func clone(in *ebpf.Record) *ebpf.Record {
 func unset(in *ebpf.Record) *ebpf.Record {
 	out := clone(in)
 	out.Id.IfIndex = ebpf.InterfaceUnset
-	out.Id.Direction = ebpf.DirectionUnset
 	return out
 }
 

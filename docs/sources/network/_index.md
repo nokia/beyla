@@ -35,8 +35,11 @@ By default, only the following attributes are reported: `k8s.src.owner.name`, `k
 | Attribute name (OpenTelemetry / Prometheus) | Description                                                                                                                                                                         |
 |---------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `beyla.ip` / `beyla_ip`                     | Local IP address of the Beyla instance that emitted the metric                                                                                                                      |
+| `transport`                                 | L4 Transport protocol (for example, `TCP` or `UDP`)                                                                                                                                 |
 | `src.address` / `src_address`               | Source IP address of Network flow                                                                                                                                                   |
-| `dst.address` / `dst_address`               | Destination IP address of Network flow                                                                                                                                              |
+| `dst.address` / `dst_address`               | Destination IP address of Network flow                                                                                                                                              
+| `src.port` / `src_port`                     | Source port of Network flow                                                                                                                                                         |
+| `dst.port` / `dst_port`                     | Destination port of Network flow                                                                                                                                                    |
 | `src.name` / `src_name`                     | Name of Network flow source: Kubernetes name, host name, or IP address                                                                                                              |
 | `dst.name` / `dst_name`                     | Name of Network flow destination: Kubernetes name, host name, or IP address                                                                                                         |
 | `src.cidr` / `src_cidr`                     | If the [`cidrs` configuration section]({{< relref "./config" >}}) is set, the CIDR that matches the source IP address                                                               |
@@ -68,13 +71,20 @@ For example:
 ```yaml
 network:
   enable: true
-  allowed_attributes:
-    - k8s.src.owner.name
-    - k8s.src.namespace
-    - k8s.dst.owner.name
-    - k8s.dst.namespace
-    - k8s.cluster.name
+attributes:
+  kubernetes:
+    enable: true
+  select:
+    beyla_network_flow_bytes:
+      include:  
+        - k8s.src.owner.name
+        - k8s.src.namespace
+        - k8s.dst.owner.name
+        - k8s.dst.namespace
+        - k8s.cluster.name
 ```
 
 In this example, the bytes metric is the aggregated by the source and destination owners. This is, all the
 pods from a given Deployment/StatefulSet/ReplicaSet/DaemonSet.
+
+For more information about the `attributes.select` section, check the [Configuration options]({{< relref "../configure/options" >}}).

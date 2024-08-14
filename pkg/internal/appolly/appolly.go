@@ -7,16 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 
-	"k8s.io/client-go/kubernetes"
-
 	"github.com/grafana/beyla/pkg/beyla"
 	"github.com/grafana/beyla/pkg/internal/discover"
-	kube2 "github.com/grafana/beyla/pkg/internal/kube"
 	"github.com/grafana/beyla/pkg/internal/pipe"
 	"github.com/grafana/beyla/pkg/internal/pipe/global"
 	"github.com/grafana/beyla/pkg/internal/request"
 	"github.com/grafana/beyla/pkg/internal/transform/kube"
-	"github.com/grafana/beyla/pkg/transform"
 )
 
 func log() *slog.Logger {
@@ -26,6 +22,7 @@ func log() *slog.Logger {
 // Instrumenter finds and instrument a service/process, and forwards the traces as
 // configured by the user
 type Instrumenter struct {
+	ctx     context.Context
 	config  *beyla.Config
 	ctxInfo *global.ContextInfo
 
@@ -37,9 +34,10 @@ type Instrumenter struct {
 }
 
 // New Instrumenter, given a Config
-func New(ctxInfo *global.ContextInfo, config *beyla.Config) *Instrumenter {
-	setupFeatureContextInfo(ctxInfo, config)
+func New(ctx context.Context, ctxInfo *global.ContextInfo, config *beyla.Config) *Instrumenter {
+	setupFeatureContextInfo(ctx, ctxInfo, config)
 	return &Instrumenter{
+		ctx:         ctx,
 		config:      config,
 		ctxInfo:     ctxInfo,
 		tracesInput: make(chan []request.Span, config.ChannelBufferLen),
@@ -48,9 +46,9 @@ func New(ctxInfo *global.ContextInfo, config *beyla.Config) *Instrumenter {
 
 // FindAndInstrument searches in background for any new executable matching the
 // selection criteria.
-func (i *Instrumenter) FindAndInstrument(ctx context.Context) error {
-	finder := discover.NewProcessFinder(ctx, i.config, i.ctxInfo)
-	foundProcesses, deletedProcesses, err := finder.Start(i.config)
+func (i *Instrumenter) FindAndInstrument() error {
+	finder := discover.NewProcessFinder(i.ctx, i.config, i.ctxInfo)
+	foundProcesses, deletedProcesses, err := finder.Start()
 	if err != nil {
 		return fmt.Errorf("couldn't start Process Finder: %w", err)
 	}
@@ -65,7 +63,7 @@ func (i *Instrumenter) FindAndInstrument(ctx context.Context) error {
 		contexts := map[uint64]cancelCtx{}
 		for {
 			select {
-			case <-ctx.Done():
+			case <-i.ctx.Done():
 				log.Debug("stopped searching for new processes to instrument")
 				return
 			case pt := <-foundProcesses:
@@ -73,7 +71,7 @@ func (i *Instrumenter) FindAndInstrument(ctx context.Context) error {
 					"inode", pt.ELFInfo.Ino, "pid", pt.ELFInfo.Pid, "exec", pt.ELFInfo.CmdExePath)
 				cctx, ok := contexts[pt.ELFInfo.Ino]
 				if !ok {
-					cctx.ctx, cctx.cancel = context.WithCancel(ctx)
+					cctx.ctx, cctx.cancel = context.WithCancel(i.ctx)
 					contexts[pt.ELFInfo.Ino] = cctx
 				}
 				go pt.Run(cctx.ctx, i.tracesInput)
@@ -93,65 +91,49 @@ func (i *Instrumenter) FindAndInstrument(ctx context.Context) error {
 
 // ReadAndForward keeps listening for traces in the BPF map, then reads,
 // processes and forwards them
-func (i *Instrumenter) ReadAndForward(ctx context.Context) error {
+func (i *Instrumenter) ReadAndForward() error {
 	log := log()
 	log.Debug("creating instrumentation pipeline")
 
 	// TODO: when we split the executable, tracer should be reconstructed somehow
 	// from this instance
-	bp, err := pipe.Build(ctx, i.config, i.ctxInfo, i.tracesInput)
+	bp, err := pipe.Build(i.ctx, i.config, i.ctxInfo, i.tracesInput)
 	if err != nil {
 		return fmt.Errorf("can't instantiate instrumentation pipeline: %w", err)
 	}
 
 	log.Info("Starting main node")
 
-	bp.Run(ctx)
+	bp.Run(i.ctx)
 
 	log.Info("exiting auto-instrumenter")
 
 	return nil
 }
 
-func setupFeatureContextInfo(ctxInfo *global.ContextInfo, config *beyla.Config) {
+func setupFeatureContextInfo(ctx context.Context, ctxInfo *global.ContextInfo, config *beyla.Config) {
 	ctxInfo.AppO11y.ReportRoutes = config.Routes != nil
-	setupKubernetes(ctxInfo, &config.Attributes.Kubernetes)
+	setupKubernetes(ctx, ctxInfo)
 }
 
 // setupKubernetes sets up common Kubernetes database and API clients that need to be accessed
 // from different stages in the Beyla pipeline
-func setupKubernetes(ctxInfo *global.ContextInfo, k8sCfg *transform.KubernetesDecorator) {
-	if !ctxInfo.K8sEnabled {
-		return
-	}
-	config, err := kube2.LoadConfig(k8sCfg.KubeconfigPath)
-	if err != nil {
-		slog.Error("can't read kubernetes config. You can't setup Kubernetes discovery and your"+
-			" traces won't be decorated with Kubernetes metadata", "error", err)
-		ctxInfo.K8sEnabled = false
+func setupKubernetes(ctx context.Context, ctxInfo *global.ContextInfo) {
+	if !ctxInfo.K8sInformer.IsKubeEnabled() {
 		return
 	}
 
-	kubeClient, err := kubernetes.NewForConfig(config)
+	informer, err := ctxInfo.K8sInformer.Get(ctx)
 	if err != nil {
-		slog.Error("can't init Kubernetes client. You can't setup Kubernetes discovery and your"+
-			" traces won't be decorated with Kubernetes metadata", "error", err)
-		ctxInfo.K8sEnabled = false
-		return
-	}
-
-	ctxInfo.AppO11y.K8sInformer = &kube2.Metadata{}
-	if err := ctxInfo.AppO11y.K8sInformer.InitFromClient(kubeClient, k8sCfg.InformersSyncTimeout); err != nil {
 		slog.Error("can't init Kubernetes informer. You can't setup Kubernetes discovery and your"+
 			" traces won't be decorated with Kubernetes metadata", "error", err)
-		ctxInfo.AppO11y.K8sInformer = nil
-		ctxInfo.K8sEnabled = false
+		ctxInfo.K8sInformer.ForceDisable()
 		return
 	}
 
-	if ctxInfo.AppO11y.K8sDatabase, err = kube.StartDatabase(ctxInfo.AppO11y.K8sInformer); err != nil {
+	if ctxInfo.AppO11y.K8sDatabase, err = kube.StartDatabase(informer); err != nil {
 		slog.Error("can't setup Kubernetes database. Your traces won't be decorated with Kubernetes metadata",
 			"error", err)
-		ctxInfo.K8sEnabled = false
+		ctxInfo.K8sInformer.ForceDisable()
 	}
 }

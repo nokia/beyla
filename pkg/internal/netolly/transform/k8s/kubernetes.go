@@ -22,11 +22,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/hashicorp/golang-lru/v2/simplelru"
-	"github.com/mariomac/pipes/pkg/node"
+	"github.com/mariomac/pipes/pipe"
 
+	attr "github.com/grafana/beyla/pkg/export/attributes/names"
+	"github.com/grafana/beyla/pkg/internal/kube"
 	"github.com/grafana/beyla/pkg/internal/netolly/ebpf"
 	"github.com/grafana/beyla/pkg/transform"
 )
@@ -41,49 +42,31 @@ const (
 	attrSuffixOwnerType = ".owner.type"
 	attrSuffixHostIP    = ".node.ip"
 	attrSuffixHostName  = ".node.name"
-
-	AttrClusterName = "k8s.cluster.name"
-
-	AttrDstNamespace = attrPrefixDst + attrSuffixNs
-	AttrDstName      = attrPrefixDst + attrSuffixName
-	AttrDstType      = attrPrefixDst + attrSuffixType
-	AttrDstOwnerName = attrPrefixDst + attrSuffixOwnerName
-	AttrDstOwnerType = attrPrefixDst + attrSuffixOwnerType
-	AttrDstHostIP    = attrPrefixDst + attrSuffixHostIP
-	AttrDstHostName  = attrPrefixDst + attrSuffixHostName
-
-	AttrSrcNamespace = attrPrefixSrc + attrSuffixNs
-	AttrSrcName      = attrPrefixSrc + attrSuffixName
-	AttrSrcType      = attrPrefixSrc + attrSuffixType
-	AttrSrcOwnerName = attrPrefixSrc + attrSuffixOwnerName
-	AttrSrcOwnerType = attrPrefixSrc + attrSuffixOwnerType
-	AttrSrcHostIP    = attrPrefixSrc + attrSuffixHostIP
-	AttrSrcHostName  = attrPrefixSrc + attrSuffixHostName
 )
 
 const alreadyLoggedIPsCacheLen = 256
-const (
-	clusterMetadataRetries       = 5
-	clusterMetadataFailRetryTime = 500 * time.Millisecond
-)
 
 func log() *slog.Logger { return slog.With("component", "k8s.MetadataDecorator") }
 
-type MetadataDecorator struct {
-	Kubernetes *transform.KubernetesDecorator
-}
-
-func (ntc MetadataDecorator) Enabled() bool {
-	return ntc.Kubernetes != nil && ntc.Kubernetes.Enabled()
-}
-
-func MetadataDecoratorProvider(ctx context.Context, cfg MetadataDecorator) (node.MiddleFunc[[]*ebpf.Record, []*ebpf.Record], error) {
-	nt, err := newDecorator(ctx, &cfg)
+func MetadataDecoratorProvider(
+	ctx context.Context,
+	cfg *transform.KubernetesDecorator,
+	k8sInformer *kube.MetadataProvider,
+) (pipe.MiddleFunc[[]*ebpf.Record, []*ebpf.Record], error) {
+	if !k8sInformer.IsKubeEnabled() {
+		// This node is not going to be instantiated. Let the pipes library just bypassing it.
+		return pipe.Bypass[[]*ebpf.Record](), nil
+	}
+	metadata, err := k8sInformer.Get(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("instantiating network transformer: %w", err)
+		return nil, fmt.Errorf("instantiating k8s.MetadataDecorator: %w", err)
+	}
+	nt, err := newDecorator(ctx, cfg, metadata)
+	if err != nil {
+		return nil, fmt.Errorf("instantiating k8s.MetadataDecorator: %w", err)
 	}
 	var decorate func([]*ebpf.Record) []*ebpf.Record
-	if cfg.Kubernetes.DropExternal {
+	if cfg.DropExternal {
 		log().Debug("will drop external flows")
 		decorate = nt.decorateMightDrop
 	} else {
@@ -101,7 +84,7 @@ func MetadataDecoratorProvider(ctx context.Context, cfg MetadataDecorator) (node
 type decorator struct {
 	log              *slog.Logger
 	alreadyLoggedIPs *simplelru.LRU[string, struct{}]
-	kube             NetworkInformers
+	kube             *kube.Metadata
 	clusterName      string
 }
 
@@ -124,10 +107,10 @@ func (n *decorator) decorateMightDrop(flows []*ebpf.Record) []*ebpf.Record {
 
 func (n *decorator) transform(flow *ebpf.Record) bool {
 	if flow.Attrs.Metadata == nil {
-		flow.Attrs.Metadata = map[string]string{}
+		flow.Attrs.Metadata = map[attr.Name]string{}
 	}
 	if n.clusterName != "" {
-		flow.Attrs.Metadata[AttrClusterName] = n.clusterName
+		flow.Attrs.Metadata[(attr.K8sClusterName)] = n.clusterName
 	}
 	srcOk := n.decorate(flow, attrPrefixSrc, flow.Id.SrcIP().IP().String())
 	dstOk := n.decorate(flow, attrPrefixDst, flow.Id.DstIP().IP().String())
@@ -136,7 +119,7 @@ func (n *decorator) transform(flow *ebpf.Record) bool {
 
 // decorate the flow with Kube metadata. Returns false if there is no metadata found for such IP
 func (n *decorator) decorate(flow *ebpf.Record, prefix, ip string) bool {
-	kubeInfo, ok := n.kube.GetInfo(ip)
+	ipinfo, meta, ok := n.kube.GetInfo(ip)
 	if !ok {
 		if n.log.Enabled(context.TODO(), slog.LevelDebug) {
 			// avoid spoofing the debug logs with the same message for each flow whose IP can't be decorated
@@ -147,35 +130,36 @@ func (n *decorator) decorate(flow *ebpf.Record, prefix, ip string) bool {
 		}
 		return false
 	}
-	flow.Attrs.Metadata[prefix+attrSuffixNs] = kubeInfo.Namespace
-	flow.Attrs.Metadata[prefix+attrSuffixName] = kubeInfo.Name
-	flow.Attrs.Metadata[prefix+attrSuffixType] = kubeInfo.Type
-	flow.Attrs.Metadata[prefix+attrSuffixOwnerName] = kubeInfo.Owner.Name
-	flow.Attrs.Metadata[prefix+attrSuffixOwnerType] = kubeInfo.Owner.Type
-	if kubeInfo.HostIP != "" {
-		flow.Attrs.Metadata[prefix+attrSuffixHostIP] = kubeInfo.HostIP
-		if kubeInfo.HostName != "" {
-			flow.Attrs.Metadata[prefix+attrSuffixHostName] = kubeInfo.HostName
+	flow.Attrs.Metadata[attr.Name(prefix+attrSuffixNs)] = meta.Namespace
+	flow.Attrs.Metadata[attr.Name(prefix+attrSuffixName)] = meta.Name
+	flow.Attrs.Metadata[attr.Name(prefix+attrSuffixType)] = ipinfo.Kind
+	flow.Attrs.Metadata[attr.Name(prefix+attrSuffixOwnerName)] = ipinfo.Owner.Name
+	flow.Attrs.Metadata[attr.Name(prefix+attrSuffixOwnerType)] = ipinfo.Owner.Kind
+	if ipinfo.HostIP != "" {
+		flow.Attrs.Metadata[attr.Name(prefix+attrSuffixHostIP)] = ipinfo.HostIP
+		if ipinfo.HostName != "" {
+			flow.Attrs.Metadata[attr.Name(prefix+attrSuffixHostName)] = ipinfo.HostName
 		}
 	}
 	// decorate other names from metadata, if required
 	if prefix == attrPrefixDst {
 		if flow.Attrs.DstName == "" {
-			flow.Attrs.DstName = kubeInfo.Name
+			flow.Attrs.DstName = meta.Name
 		}
 	} else {
 		if flow.Attrs.SrcName == "" {
-			flow.Attrs.SrcName = kubeInfo.Name
+			flow.Attrs.SrcName = meta.Name
 		}
 	}
 	return true
 }
 
 // newDecorator create a new transform
-func newDecorator(ctx context.Context, cfg *MetadataDecorator) (*decorator, error) {
+func newDecorator(ctx context.Context, cfg *transform.KubernetesDecorator, meta *kube.Metadata) (*decorator, error) {
 	nt := decorator{
 		log:         log(),
-		clusterName: kubeClusterName(ctx, cfg),
+		clusterName: transform.KubeClusterName(ctx, cfg),
+		kube:        meta,
 	}
 	if nt.log.Enabled(ctx, slog.LevelDebug) {
 		var err error
@@ -184,35 +168,5 @@ func newDecorator(ctx context.Context, cfg *MetadataDecorator) (*decorator, erro
 			return nil, fmt.Errorf("instantiating debug notified error cache: %w", err)
 		}
 	}
-
-	if err := nt.kube.InitFromConfig(cfg.Kubernetes.KubeconfigPath, cfg.Kubernetes.InformersSyncTimeout); err != nil {
-		return nil, err
-	}
 	return &nt, nil
-}
-
-func kubeClusterName(ctx context.Context, cfg *MetadataDecorator) string {
-	log := log().With("func", "kubeClusterName")
-	if cfg.Kubernetes.ClusterName != "" {
-		return cfg.Kubernetes.ClusterName
-	}
-	retries := 0
-	for retries < clusterMetadataRetries {
-		if clusterName := fetchClusterName(ctx); clusterName != "" {
-			return clusterName
-		}
-		retries++
-		log.Debug("retrying cluster name fetching in 500 ms...")
-		select {
-		case <-ctx.Done():
-			log.Debug("context canceled before starting the kubernetes decorator node")
-			return ""
-		case <-time.After(clusterMetadataFailRetryTime):
-			// retry or end!
-		}
-	}
-	log.Warn("can't fetch Kubernetes Cluster Name." +
-		" Network metrics won't contain k8s.cluster.name attribute unless you explicitly set " +
-		" the BEYLA_KUBE_CLUSTER_NAME environment variable")
-	return ""
 }

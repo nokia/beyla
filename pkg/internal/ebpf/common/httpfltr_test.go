@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+	"unsafe"
 
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/stretchr/testify/assert"
@@ -41,7 +42,7 @@ func TestHostInfo(t *testing.T) {
 		},
 	}
 
-	source, target := event.hostInfo()
+	source, target := (*BPFConnInfo)(unsafe.Pointer(&event.ConnInfo)).reqHostInfo()
 
 	assert.Equal(t, "192.168.0.1", source)
 	assert.Equal(t, "8.8.8.8", target)
@@ -53,7 +54,7 @@ func TestHostInfo(t *testing.T) {
 		},
 	}
 
-	source, target = event.hostInfo()
+	source, target = (*BPFConnInfo)(unsafe.Pointer(&event.ConnInfo)).reqHostInfo()
 
 	assert.Equal(t, "100::ffff:c0a8:1", source)
 	assert.Equal(t, "100::ffff:808:808", target)
@@ -62,10 +63,10 @@ func TestHostInfo(t *testing.T) {
 		ConnInfo: bpfConnectionInfoT{},
 	}
 
-	source, target = event.hostInfo()
+	source, target = (*BPFConnInfo)(unsafe.Pointer(&event.ConnInfo)).reqHostInfo()
 
-	assert.Equal(t, "::", source)
-	assert.Equal(t, "::", target)
+	assert.Equal(t, "", source)
+	assert.Equal(t, "", target)
 }
 
 func TestCstr(t *testing.T) {
@@ -86,6 +87,8 @@ func TestCstr(t *testing.T) {
 }
 
 func TestToRequestTrace(t *testing.T) {
+	fltr := TestPidsFilter{services: map[uint32]svc.ID{}}
+
 	var record BPFHTTPInfo
 	record.Type = 1
 	record.StartMonotimeNs = 123456
@@ -100,7 +103,7 @@ func TestToRequestTrace(t *testing.T) {
 	err := binary.Write(buf, binary.LittleEndian, &record)
 	assert.NoError(t, err)
 
-	result, _, err := ReadHTTPInfoIntoSpan(&ringbuf.Record{RawSample: buf.Bytes()})
+	result, _, err := ReadHTTPInfoIntoSpan(&ringbuf.Record{RawSample: buf.Bytes()}, &fltr)
 	assert.NoError(t, err)
 
 	expected := request.Span{
@@ -120,6 +123,8 @@ func TestToRequestTrace(t *testing.T) {
 }
 
 func TestToRequestTraceNoConnection(t *testing.T) {
+	fltr := TestPidsFilter{services: map[uint32]svc.ID{}}
+
 	var record BPFHTTPInfo
 	record.Type = 1
 	record.StartMonotimeNs = 123456
@@ -133,7 +138,7 @@ func TestToRequestTraceNoConnection(t *testing.T) {
 	err := binary.Write(buf, binary.LittleEndian, &record)
 	assert.NoError(t, err)
 
-	result, _, err := ReadHTTPInfoIntoSpan(&ringbuf.Record{RawSample: buf.Bytes()})
+	result, _, err := ReadHTTPInfoIntoSpan(&ringbuf.Record{RawSample: buf.Bytes()}, &fltr)
 	assert.NoError(t, err)
 
 	// change the expected port just before testing
@@ -154,6 +159,8 @@ func TestToRequestTraceNoConnection(t *testing.T) {
 }
 
 func TestToRequestTrace_BadHost(t *testing.T) {
+	fltr := TestPidsFilter{services: map[uint32]svc.ID{}}
+
 	var record BPFHTTPInfo
 	record.Type = 1
 	record.StartMonotimeNs = 123456
@@ -169,7 +176,7 @@ func TestToRequestTrace_BadHost(t *testing.T) {
 	err := binary.Write(buf, binary.LittleEndian, &record)
 	assert.NoError(t, err)
 
-	result, _, err := ReadHTTPInfoIntoSpan(&ringbuf.Record{RawSample: buf.Bytes()})
+	result, _, err := ReadHTTPInfoIntoSpan(&ringbuf.Record{RawSample: buf.Bytes()}, &fltr)
 	assert.NoError(t, err)
 
 	expected := request.Span{

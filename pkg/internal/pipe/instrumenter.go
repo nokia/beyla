@@ -3,14 +3,16 @@ package pipe
 import (
 	"context"
 
-	"github.com/mariomac/pipes/pkg/graph"
-	"github.com/mariomac/pipes/pkg/node"
+	"github.com/mariomac/pipes/pipe"
 
 	"github.com/grafana/beyla/pkg/beyla"
-	"github.com/grafana/beyla/pkg/internal/export/debug"
-	agent "github.com/grafana/beyla/pkg/internal/export/grafana_agent"
-	"github.com/grafana/beyla/pkg/internal/export/otel"
-	"github.com/grafana/beyla/pkg/internal/export/prom"
+	"github.com/grafana/beyla/pkg/export/alloy"
+	"github.com/grafana/beyla/pkg/export/attributes"
+	attr "github.com/grafana/beyla/pkg/export/attributes/names"
+	"github.com/grafana/beyla/pkg/export/debug"
+	"github.com/grafana/beyla/pkg/export/otel"
+	"github.com/grafana/beyla/pkg/export/prom"
+	"github.com/grafana/beyla/pkg/internal/filter"
 	"github.com/grafana/beyla/pkg/internal/imetrics"
 	"github.com/grafana/beyla/pkg/internal/pipe/global"
 	"github.com/grafana/beyla/pkg/internal/request"
@@ -21,42 +23,55 @@ import (
 // nodesMap provides the architecture of the whole processing pipeline:
 // each node and which nodes are they connected to
 type nodesMap struct {
-	TracesReader traces.ReadDecorator `sendTo:"Routes"`
+	TracesReader pipe.Start[[]request.Span]
 
-	// Routes is an optional node. If not set, data will be bypassed to the next stage in the pipeline.
-	Routes *transform.RoutesConfig `forwardTo:"Kubernetes"`
+	// Routes is an optional pipe. If not enabled, data will be bypassed to the next stage in the pipeline.
+	Routes pipe.Middle[[]request.Span, []request.Span]
 
-	// Kubernetes is an optional node. If not set, data will be bypassed to the exporters.
-	Kubernetes transform.KubernetesDecorator `forwardTo:"Metrics,Traces,Prometheus,Printer,Noop,AgentTraces"`
+	// Kubernetes is an optional pipe. If not enabled, data will be bypassed to the exporters.
+	Kubernetes pipe.Middle[[]request.Span, []request.Span]
 
-	AgentTraces beyla.TracesReceiverConfig
-	Metrics     otel.MetricsConfig
-	Traces      otel.TracesConfig
-	Prometheus  prom.PrometheusConfig
-	Printer     debug.PrintEnabled
-	Noop        debug.NoopEnabled
+	NameResolver pipe.Middle[[]request.Span, []request.Span]
+
+	AttributeFilter pipe.Middle[[]request.Span, []request.Span]
+
+	AlloyTraces pipe.Final[[]request.Span]
+	Metrics     pipe.Final[[]request.Span]
+	Traces      pipe.Final[[]request.Span]
+	Prometheus  pipe.Final[[]request.Span]
+	Printer     pipe.Final[[]request.Span]
+
+	ProcessReport pipe.Final[[]request.Span]
 }
 
-func configToNodesMap(cfg *beyla.Config) *nodesMap {
-	return &nodesMap{
-		TracesReader: traces.ReadDecorator{InstanceID: cfg.Attributes.InstanceID},
-		Routes:       cfg.Routes,
-		Kubernetes:   cfg.Attributes.Kubernetes,
-		Metrics:      cfg.Metrics,
-		Traces:       cfg.Traces,
-		Prometheus:   cfg.Prometheus,
-		Printer:      cfg.Printer,
-		Noop:         cfg.Noop,
-		AgentTraces:  cfg.TracesReceiver,
-	}
+// Connect must specify how the above nodes are connected. Nodes that are disabled
+// at build time will be Bypassed (e.g. if the Routes node is disabled, the pipes library
+// will directly connect TracesReader to Kubernetes node).
+func (n *nodesMap) Connect() {
+	n.TracesReader.SendTo(n.Routes)
+	n.Routes.SendTo(n.Kubernetes)
+	n.Kubernetes.SendTo(n.NameResolver)
+	n.NameResolver.SendTo(n.AttributeFilter)
+	n.AttributeFilter.SendTo(n.AlloyTraces, n.Metrics, n.Traces, n.Prometheus, n.Printer, n.ProcessReport)
 }
+
+// accessor functions to each field. Grouped here for code brevity during the pipeline build
+func tracesReader(n *nodesMap) *pipe.Start[[]request.Span]                  { return &n.TracesReader }
+func router(n *nodesMap) *pipe.Middle[[]request.Span, []request.Span]       { return &n.Routes }
+func kubernetes(n *nodesMap) *pipe.Middle[[]request.Span, []request.Span]   { return &n.Kubernetes }
+func nameResolver(n *nodesMap) *pipe.Middle[[]request.Span, []request.Span] { return &n.NameResolver }
+func attrFilter(n *nodesMap) *pipe.Middle[[]request.Span, []request.Span]   { return &n.AttributeFilter }
+func alloyTraces(n *nodesMap) *pipe.Final[[]request.Span]                   { return &n.AlloyTraces }
+func otelMetrics(n *nodesMap) *pipe.Final[[]request.Span]                   { return &n.Metrics }
+func otelTraces(n *nodesMap) *pipe.Final[[]request.Span]                    { return &n.Traces }
+func printer(n *nodesMap) *pipe.Final[[]request.Span]                       { return &n.Printer }
+func prometheus(n *nodesMap) *pipe.Final[[]request.Span]                    { return &n.Prometheus }
+func processReport(n *nodesMap) *pipe.Final[[]request.Span]                 { return &n.ProcessReport }
 
 // builder with injectable instantiators for unit testing
 type graphFunctions struct {
-	ctx context.Context
-
 	config  *beyla.Config
-	builder *graph.Builder
+	builder *pipe.Builder[*nodesMap]
 	ctxInfo *global.ContextInfo
 
 	// tracesCh is shared across all the eBPF tracing programs, which send there
@@ -78,31 +93,40 @@ func newGraphBuilder(ctx context.Context, config *beyla.Config, ctxInfo *global.
 	// https://github.com/mariomac/pipes/tree/main/docs/tutorial/b-highlevel/01-basic-nodes
 
 	// First, we create a graph builder
-	gnb := graph.NewBuilder(node.ChannelBufferLen(config.ChannelBufferLen))
+	gnb := pipe.NewBuilder(&nodesMap{}, pipe.ChannelBufferLen(config.ChannelBufferLen))
 	gb := &graphFunctions{
-		ctx:      ctx,
 		builder:  gnb,
 		config:   config,
 		ctxInfo:  ctxInfo,
 		tracesCh: tracesCh,
 	}
-	// Second, we register providers for each node. Each provider is a function that receives the
-	// type of each of the "nodesMap" struct fields, and returns the function that represents
-	// each node. Each function will have input and/or output channels.
-	graph.RegisterStart(gnb, gb.readDecoratorProvider)
-	graph.RegisterMiddle(gnb, transform.RoutesProvider)
-	graph.RegisterMiddle(gnb, transform.KubeDecoratorProvider(ctxInfo))
-	graph.RegisterTerminal(gnb, gb.metricsReporterProvider)
-	graph.RegisterTerminal(gnb, gb.tracesReporterProvider)
-	graph.RegisterTerminal(gnb, gb.prometheusProvider)
-	graph.RegisterTerminal(gnb, debug.NoopNode)
-	graph.RegisterTerminal(gnb, debug.PrinterNode)
-	graph.RegisterTerminal(gnb, gb.grafanaAgentTracesProvider)
+	// Second, we register providers for each pipe node.
+	pipe.AddStart(gnb, tracesReader, traces.ReadFromChannel(ctx, &traces.ReadDecorator{
+		InstanceID:  config.Attributes.InstanceID,
+		TracesInput: gb.tracesCh,
+	}))
+
+	pipe.AddMiddleProvider(gnb, router, transform.RoutesProvider(config.Routes))
+	pipe.AddMiddleProvider(gnb, kubernetes, transform.KubeDecoratorProvider(ctx, &config.Attributes.Kubernetes, ctxInfo))
+	pipe.AddMiddleProvider(gnb, nameResolver, transform.NameResolutionProvider(gb.ctxInfo, config.NameResolver))
+	pipe.AddMiddleProvider(gnb, attrFilter, filter.ByAttribute(config.Filters.Application, spanPtrPromGetters))
+	config.Metrics.Grafana = &gb.config.Grafana.OTLP
+	pipe.AddFinalProvider(gnb, otelMetrics, otel.ReportMetrics(ctx, gb.ctxInfo, &config.Metrics, config.Attributes.Select))
+	config.Traces.Grafana = &gb.config.Grafana.OTLP
+	pipe.AddFinalProvider(gnb, otelTraces, otel.TracesReceiver(ctx, config.Traces, gb.ctxInfo, config.Attributes.Select))
+	pipe.AddFinalProvider(gnb, prometheus, prom.PrometheusEndpoint(ctx, gb.ctxInfo, &config.Prometheus, config.Attributes.Select))
+	pipe.AddFinalProvider(gnb, alloyTraces, alloy.TracesReceiver(ctx, gb.ctxInfo, &config.TracesReceiver, config.Attributes.Select))
+
+	pipe.AddFinalProvider(gnb, printer, debug.PrinterNode(config.TracePrinter))
+
+	// process subpipeline will start another pipeline only to collect and export data
+	// about the processes of an instrumented application
+	pipe.AddFinalProvider(gnb, processReport, SubPipelineProvider(ctx, ctxInfo, config))
 
 	// The returned builder later invokes its "Build" function that, given
-	// the contents of the nodesMap struct, will automagically instantiate
-	// and interconnect each node according to the "nodeId" and "sendTo"
-	// annotations in the nodesMap struct definition
+	// the contents of the nodesMap struct, will instantiate
+	// and interconnect each node according to the SendTo invocations in the
+	// Connect() method of the nodesMap.
 	return gb
 }
 
@@ -110,56 +134,33 @@ func (gb *graphFunctions) buildGraph() (*Instrumenter, error) {
 	// setting explicitly some configuration properties that are needed by their
 	// respective node providers
 
-	definedNodesMap := configToNodesMap(gb.config)
-	// wiring some unconnected node information
-	definedNodesMap.TracesReader.TracesInput = gb.tracesCh
-	definedNodesMap.Metrics.Grafana = &gb.config.Grafana.OTLP
-	definedNodesMap.Traces.Grafana = &gb.config.Grafana.OTLP
-
-	grp, err := gb.builder.Build(definedNodesMap)
+	grp, err := gb.builder.Build()
 	if err != nil {
 		return nil, err
 	}
 	return &Instrumenter{
 		internalMetrics: gb.ctxInfo.Metrics,
-		graph:           &grp,
+		graph:           grp,
 	}, nil
 }
 
 type Instrumenter struct {
 	internalMetrics imetrics.Reporter
-	graph           *graph.Graph
+	graph           *pipe.Runner
 }
 
 func (i *Instrumenter) Run(ctx context.Context) {
 	go i.internalMetrics.Start(ctx)
-	i.graph.Run()
+	i.graph.Start()
+	<-i.graph.Done()
 }
 
-// behind this line, adaptors to instantiate the different pipeline nodes according to the expected signature format
-// Gocritic is disabled because we need to violate the "hugeParam" check, as the second
-// argument in the functions below need to be a value.
-
-func (gb *graphFunctions) readDecoratorProvider(config traces.ReadDecorator) (node.StartFunc[[]request.Span], error) {
-	return traces.ReadFromChannel(gb.ctx, config)
-}
-
-//nolint:gocritic
-func (gb *graphFunctions) tracesReporterProvider(config otel.TracesConfig) (node.TerminalFunc[[]request.Span], error) {
-	return otel.ReportTraces(gb.ctx, &config, gb.ctxInfo)
-}
-
-//nolint:gocritic
-func (gb *graphFunctions) metricsReporterProvider(config otel.MetricsConfig) (node.TerminalFunc[[]request.Span], error) {
-	return otel.ReportMetrics(gb.ctx, &config, gb.ctxInfo)
-}
-
-//nolint:gocritic
-func (gb *graphFunctions) prometheusProvider(config prom.PrometheusConfig) (node.TerminalFunc[[]request.Span], error) {
-	return prom.PrometheusEndpoint(gb.ctx, &config, gb.ctxInfo)
-}
-
-//nolint:gocritic
-func (gb *graphFunctions) grafanaAgentTracesProvider(config beyla.TracesReceiverConfig) (node.TerminalFunc[[]request.Span], error) {
-	return agent.TracesReceiver(gb.ctx, config)
+// spanPtrPromGetters adapts the invocation of SpanPromGetters to work with a request.Span value
+// instead of a *request.Span pointer. This is a convenience method created to avoid having to
+// rewrite the pipeline types from []request.Span types to []*request.Span
+func spanPtrPromGetters(name attr.Name) (attributes.Getter[request.Span, string], bool) {
+	if ptrGetter, ok := request.SpanPromGetters(name); ok {
+		return func(span request.Span) string { return ptrGetter(&span) }, true
+	}
+	return nil, false
 }

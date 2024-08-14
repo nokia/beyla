@@ -5,8 +5,8 @@ package integration
 import (
 	"fmt"
 	"math/rand"
-	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,10 +24,11 @@ const (
 	instrumentedServiceGorillaURL     = "http://localhost:8082"
 	instrumentedServiceGorillaMidURL  = "http://localhost:8083"
 	instrumentedServiceGorillaMid2URL = "http://localhost:8087"
+	instrumentedServiceStdTLSURL      = "https://localhost:8383"
 	prometheusHostPort                = "localhost:9090"
 	jaegerQueryURL                    = "http://localhost:16686/api/traces"
 
-	testTimeout = 30 * time.Second
+	testTimeout = 60 * time.Second
 )
 
 func rndStr() string {
@@ -49,10 +50,12 @@ func testREDMetricsHTTP(t *testing.T) {
 		instrumentedServiceGinURL,
 		instrumentedServiceGorillaMidURL,
 		instrumentedServiceGorillaMid2URL,
+		instrumentedServiceStdTLSURL,
 	} {
 		t.Run(testCaseURL, func(t *testing.T) {
 			waitForTestComponents(t, testCaseURL)
 			testREDMetricsForHTTPLibrary(t, testCaseURL, "testserver", "integration-test")
+			testSpanMetricsForHTTPLibrary(t, "testserver", "integration-test")
 		})
 	}
 }
@@ -68,6 +71,7 @@ func testREDMetricsOldHTTP(t *testing.T) {
 		t.Run(testCaseURL, func(t *testing.T) {
 			waitForTestComponents(t, testCaseURL)
 			testREDMetricsForHTTPLibrary(t, testCaseURL, "testserver", "integration-test")
+			testSpanMetricsForHTTPLibrary(t, "testserver", "integration-test")
 		})
 	}
 }
@@ -80,17 +84,77 @@ func testREDMetricsShortHTTP(t *testing.T) {
 		t.Run(testCaseURL, func(t *testing.T) {
 			waitForTestComponents(t, testCaseURL)
 			testREDMetricsForHTTPLibrary(t, testCaseURL, "testserver", "integration-test")
+			testSpanMetricsForHTTPLibrary(t, "testserver", "integration-test")
 		})
 	}
+}
+
+// **IMPORTANT** Tests must first call -> func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
+func testSpanMetricsForHTTPLibrary(t *testing.T, svcName, svcNs string) {
+	pq := prom.Client{HostPort: prometheusHostPort}
+	var results []prom.Result
+
+	// Test span metrics
+	test.Eventually(t, testTimeout, func(t require.TestingT) {
+		var err error
+		results, err = pq.Query(`traces_spanmetrics_latency_count{` +
+			`span_kind="SPAN_KIND_SERVER",` +
+			`status_code="0",` + // 404 is OK for server spans
+			`service_namespace="` + svcNs + `",` +
+			`service="` + svcName + `",` +
+			`span_name="GET /basic/:rnd"` +
+			`}`)
+		require.NoError(t, err)
+		// check span metric latency exists
+		enoughPromResults(t, results)
+		val := totalPromCount(t, results)
+		assert.LessOrEqual(t, 3, val)
+	})
+
+	test.Eventually(t, testTimeout, func(t require.TestingT) {
+		var err error
+		results, err = pq.Query(`traces_spanmetrics_calls_total{` +
+			`span_kind="SPAN_KIND_SERVER",` +
+			`status_code="0",` + // 404 is OK for server spans
+			`service_namespace="` + svcNs + `",` +
+			`service="` + svcName + `",` +
+			`span_name="GET /basic/:rnd"` +
+			`}`)
+		require.NoError(t, err)
+		// check calls total exists
+		enoughPromResults(t, results)
+		val := totalPromCount(t, results)
+		assert.LessOrEqual(t, 3, val)
+	})
+
+	test.Eventually(t, testTimeout, func(t require.TestingT) {
+		var err error
+		results, err = pq.Query(`traces_target_info{` +
+			`service_namespace="` + svcNs + `",` +
+			`service="` + svcName + `",` +
+			`telemetry_sdk_language="go"` +
+			`}`)
+		require.NoError(t, err)
+		enoughPromResults(t, results)
+		val := totalPromCount(t, results)
+		assert.LessOrEqual(t, 1, val) // we report this count for each service, doesn't matter how many calls
+	})
 }
 
 func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
 	path := "/basic/" + rndStr()
 
+	parts := strings.Split(url, ":")
+	assert.LessOrEqual(t, 3, len(parts))
+
+	lastPart := parts[len(parts)-1]
+	parts = strings.Split(lastPart, "/")
+	serverPort := parts[0]
+
 	// Call 3 times the instrumented service, forcing it to:
 	// - take at least 30ms to respond
 	// - returning a 404 code
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		doHTTPGet(t, url+"/metrics", 200)
 		doHTTPGet(t, url+path+"?delay=30ms&status=404", 404)
 		if url == instrumentedServiceGorillaURL {
@@ -109,6 +173,7 @@ func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
 			`http_response_status_code="404",` +
 			`service_namespace="` + svcNs + `",` +
 			`service_name="` + svcName + `",` +
+			`server_port="` + serverPort + `",` +
 			`http_route="/basic/:rnd",` +
 			`url_path="` + path + `"}`)
 		require.NoError(t, err)
@@ -118,8 +183,9 @@ func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
 		assert.LessOrEqual(t, 3, val)
 		if len(results) > 0 {
 			res := results[0]
-			addr := net.ParseIP(res.Metric["client_address"])
+			addr := res.Metric["client_address"]
 			assert.NotNil(t, addr)
+			assert.NotNil(t, res.Metric["server_port"])
 		}
 	})
 
@@ -139,7 +205,7 @@ func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
 		assert.LessOrEqual(t, 3, val)
 		if len(results) > 0 {
 			res := results[0]
-			addr := net.ParseIP(res.Metric["client_address"])
+			addr := res.Metric["client_address"]
 			assert.NotNil(t, addr)
 		}
 	})
@@ -268,7 +334,7 @@ func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
 	require.NoError(t, err)
 	assert.Less(t, sum, 1.0)
 	assert.Greater(t, sum, (90 * time.Millisecond).Seconds())
-	addr := net.ParseIP(res.Metric["client_address"])
+	addr := res.Metric["client_address"]
 	assert.NotNil(t, addr)
 
 	// check request_size_sum is at least 114B (3 * 38B)
@@ -286,7 +352,7 @@ func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
 	sum, err = strconv.ParseFloat(fmt.Sprint(res.Value[1]), 64)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, sum, 114.0)
-	addr = net.ParseIP(res.Metric["client_address"])
+	addr = res.Metric["client_address"]
 	assert.NotNil(t, addr)
 
 	// Check that we never recorded metrics for /metrics, in the basic test only traces are ignored
@@ -296,11 +362,19 @@ func testREDMetricsForHTTPLibrary(t *testing.T, url, svcName, svcNs string) {
 }
 
 func testREDMetricsGRPC(t *testing.T) {
+	testREDMetricsGRPCInternal(t, nil, "5051")
+}
+
+func testREDMetricsGRPCTLS(t *testing.T) {
+	testREDMetricsGRPCInternal(t, []grpcclient.PingOption{grpcclient.WithSSL(), grpcclient.WithServerAddr("localhost:50051")}, "50051")
+}
+
+func testREDMetricsGRPCInternal(t *testing.T, opts []grpcclient.PingOption, serverPort string) {
 	// Call 300 times the instrumented service, an overkill to make sure
 	// we get some of the metrics to be visible in Prometheus. This test is
 	// currently the last one that runs.
 	for i := 0; i < 300; i++ {
-		err := grpcclient.Ping()
+		err := grpcclient.Ping(opts...)
 		require.NoError(t, err)
 	}
 
@@ -314,6 +388,7 @@ func testREDMetricsGRPC(t *testing.T) {
 			`service_namespace="integration-test",` +
 			`client_address!="127.0.0.1",` + // discard the metrics from testREDMetricsForHTTPLibrary/GorillaURL
 			`service_name="testserver",` +
+			`server_port="` + serverPort + `",` +
 			`rpc_method="/routeguide.RouteGuide/GetFeature"}`)
 		require.NoError(t, err)
 		// check duration_count has at least 3 calls and all the arguments
@@ -322,8 +397,9 @@ func testREDMetricsGRPC(t *testing.T) {
 		assert.LessOrEqual(t, 3, val)
 		if len(results) > 0 {
 			res := results[0]
-			addr := net.ParseIP(res.Metric["client_address"])
+			addr := res.Metric["client_address"]
 			assert.NotNil(t, addr)
+			assert.NotNil(t, res.Metric["server_port"])
 		}
 	})
 }
@@ -360,7 +436,7 @@ func testREDMetricsForHTTPLibraryNoRoute(t *testing.T, url, svcName string) {
 		assert.LessOrEqual(t, 3, val)
 		if len(results) > 0 {
 			res := results[0]
-			addr := net.ParseIP(res.Metric["client_address"])
+			addr := res.Metric["client_address"]
 			assert.NotNil(t, addr)
 		}
 	})
@@ -381,7 +457,7 @@ func testREDMetricsForHTTPLibraryNoRoute(t *testing.T, url, svcName string) {
 		assert.LessOrEqual(t, 3, val)
 		if len(results) > 0 {
 			res := results[0]
-			addr := net.ParseIP(res.Metric["client_address"])
+			addr := res.Metric["client_address"]
 			assert.NotNil(t, addr)
 		}
 	})
@@ -508,7 +584,7 @@ func testREDMetricsForHTTPLibraryNoRoute(t *testing.T, url, svcName string) {
 	require.NoError(t, err)
 	assert.Less(t, sum, 1.0)
 	assert.Greater(t, sum, (90 * time.Millisecond).Seconds())
-	addr := net.ParseIP(res.Metric["client_address"])
+	addr := res.Metric["client_address"]
 	assert.NotNil(t, addr)
 
 	// check request_size_sum is at least 114B (3 * 38B)
@@ -526,7 +602,7 @@ func testREDMetricsForHTTPLibraryNoRoute(t *testing.T, url, svcName string) {
 	sum, err = strconv.ParseFloat(fmt.Sprint(res.Value[1]), 64)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, sum, 114.0)
-	addr = net.ParseIP(res.Metric["client_address"])
+	addr = res.Metric["client_address"]
 	assert.NotNil(t, addr)
 
 	// Check that we never recorded any /metrics calls
@@ -593,7 +669,7 @@ func testREDMetricsForGoBasicOnly(t *testing.T, url string, comm string) {
 			assert.LessOrEqual(t, 3, val)
 
 			res := results[0]
-			addr := net.ParseIP(res.Metric["client_address"])
+			addr := res.Metric["client_address"]
 			assert.NotNil(t, addr)
 		}
 	})
@@ -607,5 +683,16 @@ func testPrometheusBeylaBuildInfo(t *testing.T) {
 		results, err = pq.Query(`beyla_build_info{target_lang="go"}`)
 		require.NoError(t, err)
 		require.NotEmpty(t, results)
+	})
+}
+
+func testPrometheusNoBeylaEvents(t *testing.T) {
+	pq := prom.Client{HostPort: prometheusHostPort}
+	var results []prom.Result
+	test.Eventually(t, testTimeout, func(t require.TestingT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{service_name="beyla"}`)
+		require.NoError(t, err)
+		require.Equal(t, 0, len(results))
 	})
 }

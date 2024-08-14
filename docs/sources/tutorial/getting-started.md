@@ -94,7 +94,7 @@ The code implements an HTTP service that accepts request on port 8080. The HTTP 
 - `status` will override the returned HTTP status code (which defaults to 200). For example `curl -v "http://localhost:8080/foo?status=404"` will return a 404 status code.
 - `delay` will artificially increase the service response time. For example `curl "http://localhost:8080/bar?delay=3s"` will take at least 3 seconds to complete.
 
-Download the [server.go](/docs/beyla/latest/tutorial/resources/server.go) file from this tutorial.
+Download the [server.go](https://github.com/grafana/beyla/blob/main/docs/sources/tutorial/resources/server.go) file from this tutorial.
 
 Run the test HTTP service with the following command:
 
@@ -112,10 +112,10 @@ after configuring it to print the traces to the standard output.
 Set environment variables and run Beyla:
 
 ```sh
-BEYLA_PRINT_TRACES=true BEYLA_OPEN_PORT=8080 sudo -E beyla
+BEYLA_TRACE_PRINTER=text BEYLA_OPEN_PORT=8080 sudo -E beyla
 ```
 
-The `BEYLA_PRINT_TRACES=true` configuration option tells Beyla to log any trace to the standard output.
+The `BEYLA_TRACE_PRINTER=text` configuration option tells Beyla to log any trace to the standard output.
 The `BEYLA_OPEN_PORT=8080` option tells Beyla to instrument the service that owns the port 8080.
 Since Beyla requires administrator rights to load eBPF programs, the `beyla` command
 must run with `sudo -E` (or as a `root` user).
@@ -177,7 +177,7 @@ collectors, or how to generate [Prometheus](https://prometheus.io) metrics, see 
 
 There are two ways to forward your OpenTelemetry traces to Grafana Cloud:
 
-- Using the [Grafana Agent](/docs/agent/latest/) and configuring Beyla to forward the traces to it via
+- Using [Grafana Alloy](/docs/alloy/) and configuring Beyla to forward the traces to it via
   the standard OpenTelemetry export.
 - Configuring Beyla to submit data directly to the
   [Grafana Cloud OpenTelemetry Protocol endpoint](/docs/grafana-cloud/send-data/otlp/send-data-otlp/),

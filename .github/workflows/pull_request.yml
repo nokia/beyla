@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go: [ '1.21' ]
+        go: [ '1.22' ]
     steps:
       - uses: actions/checkout@v3
 # TODO:
@@ -31,8 +31,9 @@ jobs:
       - name: Run verification and unit tests
         run: make verify cov-exclude-generated
       - name: Report coverage
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:
-          files: ./testoutput/cover.txt
+          file: ./testoutput/cover.txt
           flags: unittests
-          token: ${{ secrets.CODECOV_TOKEN }}

@@ -18,10 +18,9 @@ IMG_NAME ?= beyla
 VERSION ?= dev
 IMG = $(IMG_REGISTRY)/$(IMG_ORG)/$(IMG_NAME):$(VERSION)
 
-# The generator is a local container image that provides a reproducible environment for
+# The generator is a container image that provides a reproducible environment for
 # building eBPF binaries
-GEN_IMG_NAME ?= ebpf-generator
-GEN_IMG ?= $(GEN_IMG_NAME):$(VERSION)
+GEN_IMG ?= ghcr.io/grafana/beyla-generator:main
 
 COMPOSE_ARGS ?= -f test/integration/docker-compose.yml
 
@@ -33,7 +32,7 @@ CLANG ?= clang
 CFLAGS := -O2 -g -Wall -Werror $(CFLAGS)
 
 # regular expressions for excluded file patterns
-EXCLUDE_COVERAGE_FILES="(bpfel_)|(/pingserver/)|(/test/collector/)|(integration/components)|(test/cmd)"
+EXCLUDE_COVERAGE_FILES="(bpfel_)|(/pingserver/)|(/grafana/beyla/test/)|(integration/components)|(/grafana/beyla/docs/)|(/grafana/beyla/configs/)|(/grafana/beyla/examples/)"
 
 .DEFAULT_GOAL := all
 
@@ -44,14 +43,20 @@ PROJECT_DIR := $(shell dirname $(abspath $(firstword $(MAKEFILE_LIST))))
 
 TOOLS_DIR ?= $(PROJECT_DIR)/bin
 
+# $(1) command name
+# $(2) repo URL
+# $(3) version
 define go-install-tool
-@[ -f $(1) ] || { \
+@[ -f "$(1)-$(3)" ] || { \
 set -e ;\
 TMP_DIR=$$(mktemp -d) ;\
 cd $$TMP_DIR ;\
 go mod init tmp ;\
-echo "Downloading $(2)" ;\
-GOBIN=$(TOOLS_DIR) GOFLAGS="-mod=mod" go install $(2) ;\
+echo "Removing any outdated version of $(1)";\
+rm -f $(1)*;\
+echo "Downloading $(2)@$(3)" ;\
+GOBIN=$(TOOLS_DIR) GOFLAGS="-mod=mod" go install "$(2)@$(3)" ;\
+touch "$(1)-$(3)";\
 rm -rf $$TMP_DIR ;\
 }
 endef
@@ -85,7 +90,7 @@ DASHBOARD_LINTER = $(TOOLS_DIR)/dashboard-linter
 GINKGO = $(TOOLS_DIR)/ginkgo
 
 define check_format
-	$(shell $(foreach FILE, $(shell find . -name "*.go" -not -path "./vendor/*"), \
+	$(shell $(foreach FILE, $(shell find . -name "*.go" -not -path "**/vendor/*"), \
 		$(GOIMPORTS_REVISER) -company-prefixes github.com/grafana -list-diff -output stdout $(FILE);))
 endef
 
@@ -93,18 +98,18 @@ endef
 prereqs:
 	@echo "### Check if prerequisites are met, and installing missing dependencies"
 	mkdir -p $(TEST_OUTPUT)/run
-	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint@v1.54.2)
-	$(call go-install-tool,$(BPF2GO),github.com/cilium/ebpf/cmd/bpf2go@$(call gomod-version,cilium/ebpf))
-	$(call go-install-tool,$(GO_OFFSETS_TRACKER),github.com/grafana/go-offsets-tracker/cmd/go-offsets-tracker@$(call gomod-version,grafana/go-offsets-tracker))
-	$(call go-install-tool,$(GOIMPORTS_REVISER),github.com/incu6us/goimports-reviser/v3@v3.4.5)
-	$(call go-install-tool,$(GO_LICENSES),github.com/google/go-licenses@v1.6.0)
-	$(call go-install-tool,$(KIND),sigs.k8s.io/kind@v0.20.0)
-	$(call go-install-tool,$(DASHBOARD_LINTER),github.com/grafana/dashboard-linter@latest)
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint,v1.57.2)
+	$(call go-install-tool,$(BPF2GO),github.com/cilium/ebpf/cmd/bpf2go,$(call gomod-version,cilium/ebpf))
+	$(call go-install-tool,$(GO_OFFSETS_TRACKER),github.com/grafana/go-offsets-tracker/cmd/go-offsets-tracker,$(call gomod-version,grafana/go-offsets-tracker))
+	$(call go-install-tool,$(GOIMPORTS_REVISER),github.com/incu6us/goimports-reviser/v3,v3.6.4)
+	$(call go-install-tool,$(GO_LICENSES),github.com/google/go-licenses,v1.6.0)
+	$(call go-install-tool,$(KIND),sigs.k8s.io/kind,v0.20.0)
+	$(call go-install-tool,$(DASHBOARD_LINTER),github.com/grafana/dashboard-linter,latest)
 
 .PHONY: fmt
 fmt: prereqs
 	@echo "### Formatting code and fixing imports"
-	@$(foreach FILE, $(shell find . -name "*.go" -not -path "./vendor/*"), \
+	@$(foreach FILE, $(shell find . -name "*.go" -not -path "**/vendor/*"), \
 		$(GOIMPORTS_REVISER) -company-prefixes github.com/grafana $(FILE);)
 
 .PHONY: checkfmt
@@ -118,8 +123,12 @@ checkfmt:
 
 .PHONY: lint-dashboard
 lint-dashboard: prereqs
-	@echo "### Linting dashboard"
-	$(DASHBOARD_LINTER) lint grafana/dashboard.json
+	@echo "### Linting dashboard";
+	@if [ "$(shell sh -c 'git ls-files --modified | grep grafana/dashboard.json ')" != "" ]; then \
+		$(DASHBOARD_LINTER) lint --strict grafana/dashboard.json; \
+	else \
+		echo '(no git changes detected. Skipping)'; \
+	fi
 
 .PHONY: lint
 lint: prereqs checkfmt
@@ -174,6 +183,11 @@ test:
 	@echo "### Testing code"
 	go test -race -mod vendor -a ./... -coverpkg=./... -coverprofile $(TEST_OUTPUT)/cover.all.txt
 
+.PHONY: test-privileged
+test-privileged:
+	@echo "### Testing code with privileged tests enabled"
+	PRIVILEGED_TESTS=true go test -race -mod vendor -a ./... -coverpkg=./... -coverprofile $(TEST_OUTPUT)/cover.all.txt
+
 .PHONY: cov-exclude-generated
 cov-exclude-generated:
 	grep -vE $(EXCLUDE_COVERAGE_FILES) $(TEST_OUTPUT)/cover.all.txt > $(TEST_OUTPUT)/cover.txt
@@ -221,9 +235,21 @@ run-integration-test:
 	go clean -testcache
 	go test -p 1 -failfast -v -timeout 60m -mod vendor -a ./test/integration/... --tags=integration
 
+.PHONY: run-integration-test-k8s
+run-integration-test-k8s:
+	@echo "### Running integration tests"
+	go clean -testcache
+	go test -p 1 -failfast -v -timeout 60m -mod vendor -a ./test/integration/... --tags=integration_k8s
+
 .PHONY: integration-test
 integration-test: prereqs prepare-integration-test
 	$(MAKE) run-integration-test || (ret=$$?; $(MAKE) cleanup-integration-test && exit $$ret)
+	$(MAKE) itest-coverage-data
+	$(MAKE) cleanup-integration-test
+
+.PHONY: integration-test-k8s
+integration-test-k8s: prereqs prepare-integration-test
+	$(MAKE) run-integration-test-k8s || (ret=$$?; $(MAKE) cleanup-integration-test && exit $$ret)
 	$(MAKE) itest-coverage-data
 	$(MAKE) cleanup-integration-test
 
@@ -239,19 +265,34 @@ itest-coverage-data:
 	grep -vE $(EXCLUDE_COVERAGE_FILES) $(TEST_OUTPUT)/itest-covdata.all.txt > $(TEST_OUTPUT)/itest-covdata.txt
 
 bin/ginkgo:
-	$(call go-install-tool,$(GINKGO),github.com/onsi/ginkgo/v2/ginkgo@latest)
+	$(call go-install-tool,$(GINKGO),github.com/onsi/ginkgo/v2/ginkgo,latest)
 
 .PHONY: oats-prereq
 oats-prereq: bin/ginkgo
-	cd test/oats && go mod vendor
+	mkdir -p $(TEST_OUTPUT)/run
+
+.PHONY: oats-test-sql
+oats-test-sql: oats-prereq
+	mkdir -p test/oats/sql/$(TEST_OUTPUT)/run
+	cd test/oats/sql && TESTCASE_BASE_PATH=./yaml $(GINKGO) -v -r
+
+.PHONY: oats-test-redis
+oats-test-redis: oats-prereq
+	mkdir -p test/oats/redis/$(TEST_OUTPUT)/run
+	cd test/oats/redis && TESTCASE_BASE_PATH=./yaml $(GINKGO) -v -r
+
+.PHONY: oats-test-kafka
+oats-test-kafka: oats-prereq
+	mkdir -p test/oats/kafka/$(TEST_OUTPUT)/run
+	cd test/oats/kafka && TESTCASE_TIMEOUT=120s TESTCASE_BASE_PATH=./yaml $(GINKGO) -v -r
 
 .PHONY: oats-test
-oats-test: oats-prereq
-	cd test/oats && TESTCASE_BASE_PATH=./yaml $(GINKGO) -v -r
+oats-test: oats-test-sql oats-test-redis oats-test-kafka
+	$(MAKE) itest-coverage-data
 
 .PHONY: oats-test-debug
 oats-test-debug: oats-prereq
-	cd test/oats && TESTCASE_BASE_PATH=./yaml TESTCASE_MANUAL_DEBUG=true TESTCASE_TIMEOUT=1h $(GINKGO) -v -r
+	cd test/oats/kafka && TESTCASE_BASE_PATH=./yaml TESTCASE_MANUAL_DEBUG=true TESTCASE_TIMEOUT=1h $(GINKGO) -v -r
 
 .PHONY: drone
 drone:
@@ -278,7 +319,11 @@ artifact: compile
 	cp third_party_licenses.csv ./bin
 	tar -C ./bin -cvzf bin/beyla.tar.gz beyla LICENSE NOTICE third_party_licenses.csv
 
-.PHONE: clean-testoutput
+.PHONY: clean-testoutput
 clean-testoutput:
 	@echo "### Cleaning ${TEST_OUTPUT} folder"
 	rm -rf ${TEST_OUTPUT}/*
+
+.PHONY: check-ebpf-integrity
+check-ebpf-integrity: docker-generate
+	git diff --name-status --exit-code || (echo "Run make docker-generate locally and commit the code changes" && false)

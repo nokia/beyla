@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration_k8s
 
 package prom
 
@@ -15,9 +15,13 @@ func TestPrometheus_MetricsDecoration_AA_WaitForComponents(t *testing.T) {
 }
 
 func TestPrometheus_MetricsDecoration_HTTP(t *testing.T) {
-	cluster.TestEnv().Test(t, k8s.FeatureHTTPMetricsDecoration())
+	cluster.TestEnv().Test(t, k8s.FeatureHTTPMetricsDecoration(k8s.PingerManifestProm))
 }
 
 func TestPrometheus_MetricsDecoration_GRPC(t *testing.T) {
-	cluster.TestEnv().Test(t, k8s.FeatureGRPCMetricsDecoration())
+	cluster.TestEnv().Test(t, k8s.FeatureGRPCMetricsDecoration(k8s.GrpcPingerManifestProm))
+}
+
+func TestPrometheus_ProcessMetrics(t *testing.T) {
+	cluster.TestEnv().Test(t, k8s.FeatureProcessMetricsDecoration(nil))
 }

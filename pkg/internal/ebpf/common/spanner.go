@@ -3,8 +3,7 @@ package ebpfcommon
 import (
 	"bytes"
 	"log/slog"
-	"net"
-	"strconv"
+	"unsafe"
 
 	trace2 "go.opentelemetry.io/otel/trace"
 
@@ -31,18 +30,10 @@ func HTTPRequestTraceToSpan(trace *HTTPRequestTrace) request.Span {
 	hostname := ""
 	hostPort := 0
 
-	switch request.EventType(trace.Type) {
-	case request.EventTypeHTTPClient, request.EventTypeHTTP:
-		peer, _ = extractHostPort(trace.RemoteAddr[:])
-		hostname, hostPort = extractHostPort(trace.Host[:])
-	case request.EventTypeGRPC:
-		hostPort = int(trace.HostPort)
-		peer = extractIP(trace.RemoteAddr[:], int(trace.RemoteAddrLen))
-		hostname = extractIP(trace.Host[:], int(trace.HostLen))
-	case request.EventTypeGRPCClient:
-		hostname, hostPort = extractHostPort(trace.Host[:])
-	default:
-		log.Warn("unknown trace type", "type", trace.Type)
+	if trace.Conn.S_port != 0 || trace.Conn.D_port != 0 {
+		peer, hostname = (*BPFConnInfo)(unsafe.Pointer(&trace.Conn)).reqHostInfo()
+
+		hostPort = int(trace.Conn.D_port)
 	}
 
 	return request.Span{
@@ -50,6 +41,7 @@ func HTTPRequestTraceToSpan(trace *HTTPRequestTrace) request.Span {
 		Method:        method,
 		Path:          path,
 		Peer:          peer,
+		PeerPort:      int(trace.Conn.S_port),
 		Host:          hostname,
 		HostPort:      hostPort,
 		ContentLength: trace.ContentLength,
@@ -89,6 +81,7 @@ func SQLRequestTraceToSpan(trace *SQLRequestTrace) request.Span {
 		Method:        method,
 		Path:          path,
 		Peer:          "",
+		PeerPort:      0,
 		Host:          "",
 		HostPort:      0,
 		ContentLength: 0,
@@ -105,40 +98,6 @@ func SQLRequestTraceToSpan(trace *SQLRequestTrace) request.Span {
 			UserPID:   trace.Pid.UserPid,
 			Namespace: trace.Pid.Ns,
 		},
+		Statement: sql,
 	}
-}
-
-func extractHostPort(b []uint8) (string, int) {
-	addrLen := bytes.IndexByte(b, 0)
-	if addrLen < 0 {
-		addrLen = len(b)
-	}
-
-	peer := ""
-	peerPort := 0
-
-	if addrLen > 0 {
-		addr := string(b[:addrLen])
-		ip, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			peer = addr
-		} else {
-			peer = ip
-			peerPort, _ = strconv.Atoi(port)
-		}
-	}
-
-	return peer, peerPort
-}
-
-func extractIP(b []uint8, size int) string {
-	// Temporary fix to avoid crashes if the data is not correct.
-	// We saw issues with peer location changes in grpc 1.60
-	if size < 0 || size > 4096 {
-		return ""
-	}
-	if size > len(b) {
-		size = len(b)
-	}
-	return net.IP(b[:size]).String()
 }

@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -50,6 +51,33 @@ func doHTTPGet(t *testing.T, path string, status int) {
 	r, err := testHTTPClient.Do(req)
 	require.NoError(t, err)
 	require.Equal(t, status, r.StatusCode)
+}
+
+// nolint:errcheck
+func doHTTPGetWithTimeout(t *testing.T, path string, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Random fake body to cause the request to have some size (38 bytes)
+	jsonBody := []byte(`{"productId": 123456, "quantity": 100}`)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, bytes.NewReader(jsonBody))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+
+	testHTTPClient.Do(req)
+}
+
+func doHTTPGetIgnoreStatus(t *testing.T, path string) {
+	// Random fake body to cause the request to have some size (38 bytes)
+	jsonBody := []byte(`{"productId": 123456, "quantity": 100}`)
+
+	req, err := http.NewRequest(http.MethodGet, path, bytes.NewReader(jsonBody))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+
+	r, _ := testHTTPClient.Do(req)
+	require.NotNil(t, r)
 }
 
 func doHTTPGetFullResponse(t *testing.T, path string, status int) {
@@ -122,6 +150,25 @@ func waitForTestComponentsSubWithTime(t *testing.T, url, subpath string, minutes
 		// we don't really care that this metric could be from a previous
 		// test. Once one it is visible, it means that Otel and Prometheus are healthy
 		results, err := pq.Query(`http_server_request_duration_seconds_count{url_path="` + subpath + `"}`)
+		require.NoError(t, err)
+		require.NotEmpty(t, results)
+	}, test.Interval(time.Second))
+}
+
+func waitForSQLTestComponents(t *testing.T, url, subpath string) {
+	pq := prom.Client{HostPort: prometheusHostPort}
+	test.Eventually(t, 1*time.Minute, func(t require.TestingT) {
+		// first, verify that the test service endpoint is healthy
+		req, err := http.NewRequest("GET", url+subpath, nil)
+		require.NoError(t, err)
+		r, err := testHTTPClient.Do(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, r.StatusCode)
+
+		// now, verify that the metric has been reported.
+		// we don't really care that this metric could be from a previous
+		// test. Once one it is visible, it means that Otel and Prometheus are healthy
+		results, err := pq.Query(`db_client_operation_duration_seconds_count{db_system="other_sql"}`)
 		require.NoError(t, err)
 		require.NotEmpty(t, results)
 	}, test.Interval(time.Second))

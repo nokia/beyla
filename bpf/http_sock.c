@@ -106,18 +106,22 @@ int BPF_KPROBE(kprobe_tcp_rcv_established, struct sock *sk, struct sk_buff *skb)
         return 0;
     }
 
-    pid_connection_info_t info = {};
+    bpf_dbg_printk("=== tcp_rcv_established id=%d ===", id);
 
-    if (parse_sock_info(sk, &info.conn)) {
-        sort_connection_info(&info.conn);
-        info.pid = pid_from_pid_tgid(id);        
+    ssl_pid_connection_info_t pid_info = {};
+
+    if (parse_sock_info(sk, &pid_info.p_conn.conn)) {
+        //u16 orig_dport = info.conn.d_port;
         //dbg_print_http_connection_info(&info.conn);
+        sort_connection_info(&pid_info.p_conn.conn);
+        pid_info.p_conn.pid = pid_from_pid_tgid(id);        
 
-        http_connection_metadata_t meta = {};
-        task_pid(&meta.pid);
-        meta.type = EVENT_HTTP_REQUEST;
-        bpf_map_update_elem(&filtered_connections, &info, &meta, BPF_NOEXIST); // On purpose BPF_NOEXIST, we don't want to overwrite data by accept or connect
-        bpf_map_update_elem(&pid_tid_to_conn, &id, &info, BPF_ANY); // to support SSL on missing handshake
+        // This is a current limitation for port ordering detection for SSL.
+        // tcp_rcv_established flip flops the ports and we can't tell if it's client or server call.
+        // If the source port for a client call is lower, we'll get this wrong.
+        // TODO: Need to fix this. 
+        pid_info.orig_dport = pid_info.p_conn.conn.s_port,
+        bpf_map_update_elem(&pid_tid_to_conn, &id, &pid_info, BPF_ANY); // to support SSL on missing handshake, respect the original info if there
     }
 
     return 0;
@@ -154,17 +158,15 @@ int BPF_KRETPROBE(kretprobe_sys_accept4, uint fd)
 
     bpf_dbg_printk("=== accept 4 ret id=%d, sock=%llx, fd=%d ===", id, args->addr, fd);
 
-    pid_connection_info_t info = {};
+    ssl_pid_connection_info_t info = {};
 
-    if (parse_accept_socket_info(args, &info.conn)) {
-        sort_connection_info(&info.conn);
+    if (parse_accept_socket_info(args, &info.p_conn.conn)) {
+        u16 orig_dport = info.p_conn.conn.d_port;
         //dbg_print_http_connection_info(&info.conn);
-        info.pid = pid_from_pid_tgid(id);
-
-        http_connection_metadata_t meta = {};
-        task_pid(&meta.pid);
-        meta.type = EVENT_HTTP_REQUEST;
-        bpf_map_update_elem(&filtered_connections, &info, &meta, BPF_ANY); // On purpose BPF_ANY, we want to overwrite stale
+        sort_connection_info(&info.p_conn.conn);
+        info.p_conn.pid = pid_from_pid_tgid(id);
+        info.orig_dport = orig_dport;
+        
         bpf_map_update_elem(&pid_tid_to_conn, &id, &info, BPF_ANY); // to support SSL on missing handshake
     }
 
@@ -221,18 +223,16 @@ int BPF_KRETPROBE(kretprobe_sys_connect, int fd)
         goto cleanup;
     }
 
-    pid_connection_info_t info = {};
+    ssl_pid_connection_info_t info = {};
 
-    if (parse_connect_sock_info(args, &info.conn)) {
+    if (parse_connect_sock_info(args, &info.p_conn.conn)) {
         bpf_dbg_printk("=== connect ret id=%d, pid=%d ===", id, pid_from_pid_tgid(id));
-        sort_connection_info(&info.conn);
+        u16 orig_dport = info.p_conn.conn.d_port;
         //dbg_print_http_connection_info(&info.conn);
-        info.pid = pid_from_pid_tgid(id);
+        sort_connection_info(&info.p_conn.conn);
+        info.p_conn.pid = pid_from_pid_tgid(id);
+        info.orig_dport = orig_dport;
 
-        http_connection_metadata_t meta = {};
-        task_pid(&meta.pid);
-        meta.type = EVENT_HTTP_CLIENT;
-        bpf_map_update_elem(&filtered_connections, &info, &meta, BPF_ANY); // On purpose BPF_ANY, we want to overwrite stale
         bpf_map_update_elem(&pid_tid_to_conn, &id, &info, BPF_ANY); // to support SSL 
     }
 
@@ -242,6 +242,29 @@ cleanup:
 }
 
 // Main HTTP read and write operations are handled with tcp_sendmsg and tcp_recvmsg 
+
+static __always_inline void *is_ssl_connection(u64 id) {
+    void *ssl = 0;
+    // Checks if it's sandwitched between active SSL handshake, read or write uprobe/uretprobe
+    void **s = bpf_map_lookup_elem(&active_ssl_handshakes, &id);
+    if (s) {
+        ssl = *s;
+    } else {
+        ssl_args_t *ssl_args = bpf_map_lookup_elem(&active_ssl_read_args, &id);
+        if (!ssl_args) {
+            ssl_args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
+        }
+        if (ssl_args) {
+            ssl = (void *)ssl_args->ssl;
+        }
+    }         
+
+    return ssl;
+}
+
+static __always_inline void *is_active_ssl(pid_connection_info_t *conn) {
+    return bpf_map_lookup_elem(&active_ssl_connections, conn);
+}
 
 // The size argument here will be always the total response size.
 // However, the return value of tcp_sendmsg tells us how much it sent. When the
@@ -265,46 +288,52 @@ int BPF_KPROBE(kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t s
     };
 
     if (parse_sock_info(sk, &s_args.p_conn.conn)) {
-        //dbg_print_http_connection_info(&info.conn); // commented out since GitHub CI doesn't like this call
+        u16 orig_dport = s_args.p_conn.conn.d_port;
+        //dbg_print_http_connection_info(&s_args.p_conn.conn); // commented out since GitHub CI doesn't like this call
         sort_connection_info(&s_args.p_conn.conn);
         s_args.p_conn.pid = pid_from_pid_tgid(id);
 
+        void *ssl = is_ssl_connection(id);
         if (size > 0) {
-            void *iovec_ptr = find_msghdr_buf(msg);
-            if (iovec_ptr) {
-                u64 sock_p = (u64)sk;
-                bpf_map_update_elem(&active_send_args, &id, &s_args, BPF_ANY);
-                bpf_map_update_elem(&active_send_sock_args, &sock_p, &s_args, BPF_ANY);
-                handle_buf_with_connection(&s_args.p_conn, iovec_ptr, size, NO_SSL, TCP_SEND);
-                // if (size < KPROBES_LARGE_RESPONSE_LEN) {
-                //     bpf_dbg_printk("Maybe we need to finish the request");
-                //     finish_possible_delayed_http_request(&s_args.p_conn);
-                // }
-            } else {
-                bpf_dbg_printk("can't find iovec ptr in msghdr, not tracking sendmsg");
-            }
-        }
+            if (!ssl) {
+                void *active_ssl = is_active_ssl(&s_args.p_conn);
+                if (!active_ssl) {
+                    u8* buf = iovec_memory();
+                    if (buf) {
+                        size = read_msghdr_buf(msg, buf, size);
+                        if (size) {
+                            u64 sock_p = (u64)sk;
+                            bpf_map_update_elem(&active_send_args, &id, &s_args, BPF_ANY);
+                            bpf_map_update_elem(&active_send_sock_args, &sock_p, &s_args, BPF_ANY);
 
-        void *ssl = 0;
-        // Checks if it's sandwitched between active SSL handshake, read or write uprobe/uretprobe
-        void **s = bpf_map_lookup_elem(&active_ssl_handshakes, &id);
-        if (s) {
-            ssl = *s;
-        } else {
-            ssl_args_t *ssl_args = bpf_map_lookup_elem(&active_ssl_read_args, &id);
-            if (!ssl_args) {
-                ssl_args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
-            }
-            if (ssl_args) {
-                ssl = (void *)ssl_args->ssl;
+                            // Logically last for !ssl.
+                            handle_buf_with_connection(ctx, &s_args.p_conn, buf, size, NO_SSL, TCP_SEND, orig_dport);
+                        } else {
+                            bpf_dbg_printk("can't find iovec ptr in msghdr, not tracking sendmsg");
+                        }
+                    }
+                } else {
+                    bpf_dbg_printk("tcp_sendmsg for identified SSL connection, ignoring...");
+                }
+            } else {
+                bpf_dbg_printk("tcp_sendmsg for identified SSL connection, ignoring...");
             }
         }
 
         if (!ssl) {
             return 0;
         }
+
         bpf_dbg_printk("=== kprobe SSL tcp_sendmsg=%d sock=%llx ssl=%llx ===", id, sk, ssl);
-        bpf_map_update_elem(&ssl_to_conn, &ssl, &s_args.p_conn, BPF_ANY);
+        ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &ssl);
+        if (s_conn) {
+            finish_possible_delayed_tls_http_request(&s_conn->p_conn, ssl);
+        }
+        ssl_pid_connection_info_t ssl_conn = {
+            .orig_dport = orig_dport,
+        };
+        bpf_memcpy(&ssl_conn.p_conn, &s_args.p_conn, sizeof(pid_connection_info_t));
+        bpf_map_update_elem(&ssl_to_conn, &ssl, &ssl_conn, BPF_ANY);
     }
 
     return 0;
@@ -359,9 +388,18 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock *sk, long timeout) {
 
     u64 sock_p = (u64)sk;
 
-    bpf_printk("=== kprobe tcp_close %d sock %llx ===", id, sk);
+    bpf_dbg_printk("=== kprobe tcp_close %d sock %llx ===", id, sk);
 
     ensure_sent_event(id, &sock_p);
+
+    pid_connection_info_t info = {};
+
+    if (parse_sock_info(sk, &info.conn)) {
+        sort_connection_info(&info.conn);
+        //dbg_print_http_connection_info(&info.conn);
+        info.pid = pid_from_pid_tgid(id);
+        bpf_map_delete_elem(&ongoing_tcp_req, &info);
+    }
 
     bpf_map_delete_elem(&active_send_args, &id);
     bpf_map_delete_elem(&active_send_sock_args, &sock_p);
@@ -390,7 +428,7 @@ int BPF_KPROBE(kprobe_tcp_recvmsg, struct sock *sk, struct msghdr *msg, size_t l
     // can get modified in non-reversible way if the incoming packet is large and broken down in parts. 
     recv_args_t args = {
         .sock_ptr = (u64)sk,
-        .iovec_ptr = (u64)find_msghdr_buf(msg)
+        .iovec_ptr = (u64)(msg)
     };
 
     bpf_map_update_elem(&active_recv_args, &id, &args, BPF_ANY);
@@ -409,6 +447,7 @@ int BPF_KRETPROBE(kretprobe_tcp_recvmsg, int copied_len) {
     recv_args_t *args = bpf_map_lookup_elem(&active_recv_args, &id);
 
     if (!args || (copied_len <= 0)) {
+        bpf_map_delete_elem(&active_recv_args, &id);
         goto done;
     }
 
@@ -416,20 +455,48 @@ int BPF_KRETPROBE(kretprobe_tcp_recvmsg, int copied_len) {
 
     if (!args->iovec_ptr) {
         bpf_dbg_printk("iovec_ptr found in kprobe is NULL, ignoring this tcp_recvmsg");
+        bpf_map_delete_elem(&active_recv_args, &id);
+
+        goto done;
     }
 
     pid_connection_info_t info = {};
 
-    if (parse_sock_info((struct sock *)args->sock_ptr, &info.conn)) {
-        sort_connection_info(&info.conn);
+    void *iovec_ptr = (void *)args->iovec_ptr;
+    void *sock_ptr = (void *)args->sock_ptr;
+
+    bpf_map_delete_elem(&active_recv_args, &id);
+
+    if (parse_sock_info((struct sock *)sock_ptr, &info.conn)) {
+        u16 orig_dport = info.conn.d_port;
         //dbg_print_http_connection_info(&info.conn);
+        sort_connection_info(&info.conn);
         info.pid = pid_from_pid_tgid(id);
-        handle_buf_with_connection(&info, (void *)args->iovec_ptr, copied_len, NO_SSL, TCP_RECV);
+
+        void *ssl = is_ssl_connection(id);
+
+        if (!ssl) {
+            void *active_ssl = is_active_ssl(&info);
+            if (!active_ssl) {
+                u8* buf = iovec_memory();
+                if (buf) {
+                    copied_len = read_msghdr_buf((void *)iovec_ptr, buf, copied_len);
+                    if (copied_len) {
+                        // doesn't return must be logically last statement
+                        handle_buf_with_connection(ctx, &info, buf, copied_len, NO_SSL, TCP_RECV, orig_dport);
+                    } else {
+                        bpf_dbg_printk("Not copied anything");
+                    }
+                }
+            } else {
+                bpf_dbg_printk("tcp_recvmsg for an identified SSL connection, ignoring...");
+            }
+        } else {
+            bpf_dbg_printk("tcp_recvmsg for an identified SSL connection, ignoring...");
+        }
     }
 
 done:
-    bpf_map_delete_elem(&active_recv_args, &id);
-
     return 0;
 }
 
@@ -452,9 +519,6 @@ int socket__http_filter(struct __sk_buff *skb) {
     if (!tcp_close(&tcp) && tcp_empty(&tcp, skb)) {
         return 0;
     }
-
-    // sorting must happen here, before we check or set dups
-    sort_connection_info(&conn);
     
     // we don't want to read the whole buffer for every packed that passes our checks, we read only a bit and check if it's truly HTTP request/response.
     unsigned char buf[MIN_HTTP_SIZE] = {0};
@@ -466,7 +530,10 @@ int socket__http_filter(struct __sk_buff *skb) {
     }
 
     u8 packet_type = 0;
-    if (is_http(buf, len, &packet_type)) { // we must check tcp_close second, a packet can be a close and a response
+    if (is_http(buf, len, &packet_type)) { // we must check tcp_close second, a packet can be a close and a response      
+        //dbg_print_http_connection_info(&conn); // commented out since GitHub CI doesn't like this call
+        sort_connection_info(&conn);
+
         http_info_t info = {0};
         info.conn_info = conn;
 
@@ -557,8 +624,8 @@ int BPF_KPROBE(kprobe_sys_exit, int status) {
         return 0;
     }
 
-    pid_key_t task = {0};
-    task_tid(&task);
+    trace_key_t task = {0};
+    task_tid(&task.p_key);
 
     bpf_dbg_printk("sys_exit %d, pid=%d, valid_pid(id)=%d", id, pid_from_pid_tgid(id), valid_pid(id));
  
@@ -567,9 +634,12 @@ int BPF_KPROBE(kprobe_sys_exit, int status) {
     if (s_args) {
         bpf_dbg_printk("Checking if we need to finish the request per thread id");
         finish_possible_delayed_http_request(&s_args->p_conn);
+        bpf_map_delete_elem(&active_ssl_connections, &s_args->p_conn);
     }
 
-    bpf_map_delete_elem(&clone_map, &task);
+    bpf_map_delete_elem(&clone_map, &task.p_key);
+    // This won't delete trace ids for traces with extra_id, like NodeJS. But, 
+    // we expect that it doesn't matter, since NodeJS main thread won't exit. 
     bpf_map_delete_elem(&server_traces, &task);
     
     return 0;

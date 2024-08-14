@@ -53,7 +53,7 @@ func printFeatureWithClient(point *pb.Point, counter int) {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	conn, err := grpc.Dial(*serverAddr, opts...)
+	conn, err := grpc.NewClient(*serverAddr, opts...)
 	if err != nil {
 		slog.Error("fail to dial", err)
 		os.Exit(-1)
@@ -67,9 +67,6 @@ func printFeatureWithClient(point *pb.Point, counter int) {
 // printFeature gets the feature for the given point.
 func printFeature(client pb.RouteGuideClient, point *pb.Point, counter int) {
 	slog.Debug("Getting feature for point", "lat", point.Latitude, "long", point.Longitude)
-	// ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	// defer cancel()
-
 	ctx := context.Background()
 
 	var traceID [16]byte
@@ -103,6 +100,7 @@ func printFeatureWrapper(client pb.RouteGuideClient, point *pb.Point) {
 	feature, err := client.GetFeatureWrapper(ctx, point)
 	if err != nil {
 		slog.Error("client.GetFeature failed", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	if slog.Default().Enabled(context.TODO(), slog.LevelDebug) {
@@ -118,6 +116,7 @@ func printFeatures(client pb.RouteGuideClient, rect *pb.Rectangle) {
 	stream, err := client.ListFeatures(ctx, rect)
 	if err != nil {
 		slog.Error("client.ListFeatures failed", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	for {
@@ -149,17 +148,20 @@ func runRecordRoute(client pb.RouteGuideClient) {
 	stream, err := client.RecordRoute(ctx)
 	if err != nil {
 		slog.Error("client.RecordRoute failed", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	for _, point := range points {
 		if err := stream.Send(point); err != nil {
 			slog.Error("client.RecordRoute: stream.Send failed", err, "point", point)
+			// nolint:gocritic
 			os.Exit(-1)
 		}
 	}
 	reply, err := stream.CloseAndRecv()
 	if err != nil {
 		slog.Error("client.RecordRoute failed", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	slog.Info("Route summary", "reply", reply)
@@ -180,6 +182,7 @@ func runRouteChat(client pb.RouteGuideClient) {
 	stream, err := client.RouteChat(ctx)
 	if err != nil {
 		slog.Error("client.RouteChat failed", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	waitc := make(chan struct{})
@@ -193,6 +196,7 @@ func runRouteChat(client pb.RouteGuideClient) {
 			}
 			if err != nil {
 				slog.Error("client.RouteChat failed", err)
+				// nolint:gocritic
 				os.Exit(-1)
 			}
 			slog.Info("Got", "message", in.Message, "lat", in.Location.Latitude, "long", in.Location.Longitude)
@@ -207,6 +211,7 @@ func runRouteChat(client pb.RouteGuideClient) {
 	err = stream.CloseSend()
 	if err != nil {
 		slog.Error("client.CloseSend", err)
+		// nolint:gocritic
 		os.Exit(-1)
 	}
 	<-waitc
@@ -247,7 +252,7 @@ func main() {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	conn, err := grpc.Dial(*serverAddr, opts...)
+	conn, err := grpc.NewClient(*serverAddr, opts...)
 	if err != nil {
 		slog.Error("fail to dial", err)
 		os.Exit(-1)
@@ -263,7 +268,7 @@ func main() {
 	counter := 1
 
 	// Looking for a valid feature
-	//printFeature(client, &pb.Point{Latitude: 409146138, Longitude: -746188906}, counter)
+	// printFeature(client, &pb.Point{Latitude: 409146138, Longitude: -746188906}, counter)
 
 	if !*ping {
 		fmt.Printf("Sleeping, press any key\n")

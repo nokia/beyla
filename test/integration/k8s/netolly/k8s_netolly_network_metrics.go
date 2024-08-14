@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration_k8s
 
 package otel
 
@@ -46,7 +46,8 @@ func DoTestNetFlowBytesForExistingConnections(ctx context.Context, t *testing.T,
 		assert.Equal(t, "internal-pinger", metric["k8s_src_name"])
 		assert.Equal(t, "Pod", metric["k8s_src_owner_type"])
 		assert.Equal(t, "Pod", metric["k8s_src_type"])
-		assert.Equal(t, "test-kind-cluster-netolly-control-plane",
+		assert.Regexp(t,
+			regexp.MustCompile("^test-kind-cluster-netolly-.*control-plane"),
 			metric["k8s_src_node_name"])
 		assertIsIP(t, metric["k8s_src_node_ip"])
 		assert.Equal(t, "default", metric["k8s_dst_namespace"])
@@ -55,6 +56,8 @@ func DoTestNetFlowBytesForExistingConnections(ctx context.Context, t *testing.T,
 		assert.Equal(t, "Service", metric["k8s_dst_type"])
 		assert.Contains(t, podSubnets, metric["src_cidr"], metric)
 		assert.Contains(t, svcSubnets, metric["dst_cidr"], metric)
+		assert.Equal(t, "8080", metric["server_port"])
+		assert.NotEqual(t, "8080", metric["client_port"])
 		// services don't have host IP or name
 	})
 	// testing request flows (to testserver as Pod)
@@ -73,7 +76,8 @@ func DoTestNetFlowBytesForExistingConnections(ctx context.Context, t *testing.T,
 		assert.Equal(t, "internal-pinger", metric["k8s_src_name"])
 		assert.Equal(t, "Pod", metric["k8s_src_owner_type"])
 		assert.Equal(t, "Pod", metric["k8s_src_type"])
-		assert.Equal(t, "test-kind-cluster-netolly-control-plane",
+		assert.Regexp(t,
+			regexp.MustCompile("^test-kind-cluster-netolly-.*control-plane"),
 			metric["k8s_src_node_name"])
 		assertIsIP(t, metric["k8s_src_node_ip"])
 		assert.Equal(t, "default", metric["k8s_dst_namespace"])
@@ -81,11 +85,14 @@ func DoTestNetFlowBytesForExistingConnections(ctx context.Context, t *testing.T,
 		assert.Equal(t, "Deployment", metric["k8s_dst_owner_type"])
 		assert.Equal(t, "testserver", metric["k8s_dst_owner_name"])
 		assert.Equal(t, "Pod", metric["k8s_dst_type"])
-		assert.Equal(t, "test-kind-cluster-netolly-control-plane",
+		assert.Regexp(t,
+			regexp.MustCompile("^test-kind-cluster-netolly-.*control-plane"),
 			metric["k8s_dst_node_name"])
 		assertIsIP(t, metric["k8s_dst_node_ip"])
 		assert.Contains(t, podSubnets, metric["src_cidr"], metric)
 		assert.Contains(t, podSubnets, metric["dst_cidr"], metric)
+		assert.Equal(t, "8080", metric["server_port"])
+		assert.NotEqual(t, "8080", metric["client_port"])
 	})
 
 	// testing response flows (from testserver Pod)
@@ -104,16 +111,23 @@ func DoTestNetFlowBytesForExistingConnections(ctx context.Context, t *testing.T,
 		assert.Regexp(t, regexp.MustCompile("^testserver-"), metric["k8s_src_name"])
 		assert.Equal(t, "Deployment", metric["k8s_src_owner_type"])
 		assert.Equal(t, "Pod", metric["k8s_src_type"])
-		assert.Equal(t, "test-kind-cluster-netolly-control-plane", metric["k8s_src_node_name"])
+		assert.Regexp(t,
+			regexp.MustCompile("^test-kind-cluster-netolly-.*control-plane"),
+			metric["k8s_src_node_name"])
 		assertIsIP(t, metric["k8s_src_node_ip"])
 		assert.Equal(t, "default", metric["k8s_dst_namespace"])
 		assert.Equal(t, "internal-pinger", metric["k8s_dst_name"])
 		assert.Equal(t, "Pod", metric["k8s_dst_owner_type"])
 		assert.Equal(t, "Pod", metric["k8s_dst_type"])
-		assert.Equal(t, "test-kind-cluster-netolly-control-plane", metric["k8s_dst_node_name"])
+		assert.Regexp(t,
+			regexp.MustCompile("^test-kind-cluster-netolly-.*control-plane"),
+			metric["k8s_dst_node_name"])
 		assertIsIP(t, metric["k8s_dst_node_ip"])
 		assert.Contains(t, podSubnets, metric["src_cidr"], metric)
 		assert.Contains(t, podSubnets, metric["dst_cidr"], metric)
+		assert.Equal(t, "TCP", metric["transport"])
+		assert.Equal(t, "8080", metric["server_port"])
+		assert.NotEqual(t, "8080", metric["client_port"])
 	})
 
 	// testing response flows (from testserver Service)
@@ -137,16 +151,28 @@ func DoTestNetFlowBytesForExistingConnections(ctx context.Context, t *testing.T,
 		assert.Equal(t, "internal-pinger", metric["k8s_dst_name"])
 		assert.Equal(t, "Pod", metric["k8s_dst_owner_type"])
 		assert.Equal(t, "Pod", metric["k8s_dst_type"])
-		assert.Equal(t, "test-kind-cluster-netolly-control-plane", metric["k8s_dst_node_name"])
+		assert.Regexp(t,
+			regexp.MustCompile("^test-kind-cluster-netolly-.*control-plane"),
+			metric["k8s_dst_node_name"])
 		assertIsIP(t, metric["k8s_dst_node_ip"])
 		assert.Contains(t, svcSubnets, metric["src_cidr"], metric)
 		assert.Contains(t, podSubnets, metric["dst_cidr"], metric)
+		assert.Equal(t, "8080", metric["server_port"])
+		assert.NotEqual(t, "8080", metric["client_port"])
 	})
 
 	// check that there aren't captured flows if there is no communication
 	results, err := pq.Query(`beyla_network_flow_bytes_total{src_name="internal-pinger",dst_name="otherinstance"}`)
 	require.NoError(t, err)
 	require.Empty(t, results)
+
+	// check that only TCP traffic is captured, according to the Protocols configuration option
+	results, err = pq.Query(`beyla_network_flow_bytes_total`)
+	require.NoError(t, err)
+	require.NotEmpty(t, results)
+	for _, result := range results {
+		assert.Equal(t, "TCP", result.Metric["transport"])
+	}
 
 	return ctx
 }

@@ -25,6 +25,7 @@ func TestSuite(t *testing.T) {
 	t.Run("HTTP traces (no traceID)", testHTTPTracesNoTraceID)
 	t.Run("GRPC traces", testGRPCTraces)
 	t.Run("GRPC RED metrics", testREDMetricsGRPC)
+	t.Run("GRPC TLS RED metrics", testREDMetricsGRPCTLS)
 	t.Run("Internal Prometheus metrics", testInternalPrometheusExport)
 
 	t.Run("BPF pinning folder mounted", testBPFPinningMounted)
@@ -79,6 +80,12 @@ func TestSuiteClientPromScrape(t *testing.T) {
 	require.NoError(t, compose.Up())
 	t.Run("Client RED metrics", testREDMetricsForClientHTTPLibraryNoTraces)
 	t.Run("Testing Beyla Build Info metric", testPrometheusBeylaBuildInfo)
+	t.Run("Testing process-level metrics", testProcesses(map[string]string{
+		"process_executable_name": "pingclient",
+		"process_executable_path": "/pingclient",
+		"process_command":         "pingclient",
+		"process_command_line":    "/pingclient",
+	}))
 
 	t.Run("BPF pinning folder mounted", testBPFPinningMounted)
 	require.NoError(t, compose.Close())
@@ -212,6 +219,8 @@ func TestSuite_PrometheusScrape(t *testing.T) {
 	compose.Env = append(compose.Env,
 		`INSTRUMENTER_CONFIG_SUFFIX=-promscrape`,
 		`PROM_CONFIG_SUFFIX=-promscrape`,
+		`BEYLA_EXECUTABLE_NAME=`,
+		`BEYLA_OPEN_PORT=8082,8999`, // force Beyla self-instrumentation to ensure we don't do it
 	)
 
 	require.NoError(t, err)
@@ -220,6 +229,13 @@ func TestSuite_PrometheusScrape(t *testing.T) {
 	t.Run("GRPC RED metrics", testREDMetricsGRPC)
 	t.Run("Internal Prometheus metrics", testInternalPrometheusExport)
 	t.Run("Testing Beyla Build Info metric", testPrometheusBeylaBuildInfo)
+	t.Run("Testing for no Beyla self metrics", testPrometheusNoBeylaEvents)
+	t.Run("Testing process-level metrics", testProcesses(map[string]string{
+		"process_executable_name": "testserver",
+		"process_executable_path": "/testserver",
+		"process_command":         "testserver",
+		"process_command_line":    "/testserver",
+	}))
 
 	t.Run("BPF pinning folder mounted", testBPFPinningMounted)
 	require.NoError(t, compose.Close())
@@ -300,7 +316,7 @@ func TestSuite_Rust(t *testing.T) {
 
 func TestSuite_RustSSL(t *testing.T) {
 	compose, err := docker.ComposeSuite("docker-compose-rust.yml", path.Join(pathOutput, "test-suite-rust-tls.log"))
-	compose.Env = append(compose.Env, `BEYLA_OPEN_PORT=8490`, `BEYLA_EXECUTABLE_NAME=`, `TEST_SERVICE_PORTS=8491:8490`, `TESTSERVER_IMAGE_SUFFIX=-ssl`, `TESTSERVER_IMAGE_VERSION=0.0.1`)
+	compose.Env = append(compose.Env, `BEYLA_OPEN_PORT=8490`, `BEYLA_EXECUTABLE_NAME=`, `TEST_SERVICE_PORTS=8491:8490`, `TESTSERVER_IMAGE_SUFFIX=-ssl`, `TESTSERVER_IMAGE_VERSION=0.0.3`)
 	require.NoError(t, err)
 	require.NoError(t, compose.Up())
 	t.Run("Rust RED metrics", testREDMetricsRustHTTPS)
@@ -399,6 +415,25 @@ func TestSuite_Python(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, compose.Up())
 	t.Run("Python RED metrics", testREDMetricsPythonHTTP)
+	t.Run("Python RED metrics with timeouts", testREDMetricsTimeoutPythonHTTP)
+	t.Run("Checking process metrics", testProcesses(map[string]string{
+		"process_executable_name": "python",
+		"process_executable_path": "/usr/local/bin/python",
+		"process_command":         "gunicorn",
+		"process_command_line":    "/usr/local/bin/python /usr/local/bin/gunicorn -w 4 -b 0.0.0.0:8380 main:app --timeout 90",
+	}))
+	t.Run("BPF pinning folder mounted", testBPFPinningMounted)
+	require.NoError(t, compose.Close())
+	t.Run("BPF pinning folder unmounted", testBPFPinningUnmounted)
+}
+
+// Uses both HTTP and SQL, but we want to see only SQL events, since we are filtering by SQL only
+func TestSuite_PythonSQL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-sql.yml", path.Join(pathOutput, "test-suite-python-sql.log"))
+	compose.Env = append(compose.Env, `BEYLA_OPEN_PORT=8080`, `BEYLA_EXECUTABLE_NAME=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+	t.Run("Python SQL metrics", testREDMetricsPythonSQLOnly)
 	t.Run("BPF pinning folder mounted", testBPFPinningMounted)
 	require.NoError(t, compose.Close())
 	t.Run("BPF pinning folder unmounted", testBPFPinningUnmounted)
@@ -493,6 +528,16 @@ func TestSuiteNoRoutes(t *testing.T) {
 	t.Run("BPF pinning folder unmounted", testBPFPinningUnmounted)
 }
 
+func TestSuite_Elixir(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-elixir.yml", path.Join(pathOutput, "test-suite-elixir.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+	t.Run("Elixir RED metrics", testREDMetricsElixirHTTP)
+	t.Run("BPF pinning folder mounted", testBPFPinningMounted)
+	require.NoError(t, compose.Close())
+	t.Run("BPF pinning folder unmounted", testBPFPinningUnmounted)
+}
+
 // Helpers
 
 var lockdownPath = "/sys/kernel/security/lockdown"
@@ -510,14 +555,16 @@ func KernelLockdownMode() bool {
 		scanner := bufio.NewScanner(f)
 		if scanner.Scan() {
 			lockdown := scanner.Text()
-			if strings.Contains(lockdown, "[none]") {
+			switch {
+			case strings.Contains(lockdown, "[none]"):
 				return false
-			} else if strings.Contains(lockdown, "[integrity]") {
+			case strings.Contains(lockdown, "[integrity]"):
 				return true
-			} else if strings.Contains(lockdown, "[confidentiality]") {
+			case strings.Contains(lockdown, "[confidentiality]"):
+				return true
+			default:
 				return true
 			}
-			return true
 		}
 
 		return true

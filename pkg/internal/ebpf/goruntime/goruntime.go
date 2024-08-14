@@ -50,12 +50,12 @@ func New(cfg *beyla.Config, metrics imetrics.Reporter) *Tracer {
 	}
 }
 
-func (p *Tracer) AllowPID(pid uint32, svc svc.ID) {
-	p.pidsFilter.AllowPID(pid, svc, ebpfcommon.PIDTypeGo)
+func (p *Tracer) AllowPID(pid, ns uint32, svc svc.ID) {
+	p.pidsFilter.AllowPID(pid, ns, svc, ebpfcommon.PIDTypeGo)
 }
 
-func (p *Tracer) BlockPID(pid uint32) {
-	p.pidsFilter.BlockPID(pid)
+func (p *Tracer) BlockPID(pid, ns uint32) {
+	p.pidsFilter.BlockPID(pid, ns)
 }
 
 func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
@@ -65,6 +65,8 @@ func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
 	}
 	return loader()
 }
+
+func (p *Tracer) SetupTailCalls() {}
 
 func (p *Tracer) Constants(_ *exec.FileInfo, _ *goexec.Offsets) map[string]any {
 	return make(map[string]any)

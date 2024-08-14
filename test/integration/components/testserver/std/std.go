@@ -2,9 +2,12 @@ package std
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -31,6 +34,11 @@ func HTTPHandler(log *slog.Logger, echoPort int) http.HandlerFunc {
 
 		if req.RequestURI == "/echoCall" {
 			echoCall(rw)
+			return
+		}
+
+		if req.RequestURI == "/echoLowPort" {
+			echoLowPort(rw)
 			return
 		}
 
@@ -105,6 +113,32 @@ func echo(rw http.ResponseWriter, port int) {
 	rw.WriteHeader(res.StatusCode)
 }
 
+var addrLowPort = net.TCPAddr{Port: 7000}
+var transport = &http.Transport{
+	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	DialContext: (&net.Dialer{
+		LocalAddr: &addrLowPort,
+	}).DialContext,
+}
+var httpClient = &http.Client{Transport: transport}
+
+func echoLowPort(rw http.ResponseWriter) {
+
+	requestURL := os.Getenv("TARGET_URL")
+
+	slog.Debug("calling", "url", requestURL)
+
+	res, err := httpClient.Get(requestURL)
+	if err != nil {
+		slog.Error("error making http request", err)
+		rw.WriteHeader(500)
+		return
+	}
+
+	defer res.Body.Close()
+	rw.WriteHeader(res.StatusCode)
+}
+
 func echoDist(rw http.ResponseWriter) {
 	requestURL := "http://pytestserver:8083/tracemetoo"
 
@@ -123,7 +157,7 @@ func echoDist(rw http.ResponseWriter) {
 
 func echoCall(rw http.ResponseWriter) {
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	conn, err := grpc.Dial("localhost:5051", opts...)
+	conn, err := grpc.NewClient("localhost:5051", opts...)
 	if err != nil {
 		slog.Error("fail to dial", err)
 		rw.WriteHeader(500)
@@ -139,7 +173,7 @@ func echoCall(rw http.ResponseWriter) {
 	defer cancel()
 	_, err = client.GetFeature(ctx, point)
 	if err != nil {
-		slog.Error("client.GetFeature failed", err)
+		slog.Error("client.GetFeature failed", "error", err)
 		rw.WriteHeader(500)
 		return
 	}
@@ -151,5 +185,13 @@ func Setup(port int) {
 	address := fmt.Sprintf(":%d", port)
 	log.Info("starting HTTP server", "address", address)
 	err := http.ListenAndServe(address, HTTPHandler(log, port))
-	log.Error("HTTP server has unexpectedly stopped", err)
+	log.Error("HTTP server has unexpectedly stopped", "error", err)
+}
+
+func SetupTLS(port int) {
+	log := slog.With("component", "std.Server")
+	address := fmt.Sprintf(":%d", port)
+	log.Info("starting HTTPS server", "address", address)
+	err := http.ListenAndServeTLS(address, "x509/server_test_cert.pem", "x509/server_test_key.pem", HTTPHandler(log, port))
+	log.Error("HTTPS server has unexpectedly stopped", "error", err)
 }

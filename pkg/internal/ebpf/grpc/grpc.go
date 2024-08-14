@@ -56,12 +56,12 @@ func New(cfg *beyla.Config, metrics imetrics.Reporter) *Tracer {
 	}
 }
 
-func (p *Tracer) AllowPID(pid uint32, svc svc.ID) {
-	p.pidsFilter.AllowPID(pid, svc, ebpfcommon.PIDTypeGo)
+func (p *Tracer) AllowPID(pid, ns uint32, svc svc.ID) {
+	p.pidsFilter.AllowPID(pid, ns, svc, ebpfcommon.PIDTypeGo)
 }
 
-func (p *Tracer) BlockPID(pid uint32) {
-	p.pidsFilter.BlockPID(pid)
+func (p *Tracer) BlockPID(pid, ns uint32) {
+	p.pidsFilter.BlockPID(pid, ns)
 }
 
 func (p *Tracer) supportsContextPropagation() bool {
@@ -80,10 +80,13 @@ func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
 			loader = loadBpf_tp_debug
 		}
 	} else {
-		p.log.Info("Kernel in lockdown mode or older than 5.17, trace info propagation in gRPC headers is disabled.")
+		p.log.Info("Kernel in lockdown mode, missing CAP_SYS_ADMIN" +
+			" or older than 5.17, trace info propagation in gRPC headers is disabled.")
 	}
 	return loader()
 }
+
+func (p *Tracer) SetupTailCalls() {}
 
 func (p *Tracer) Constants(_ *exec.FileInfo, offsets *goexec.Offsets) map[string]any {
 	// Set the field offsets and the logLevel for grpc BPF program,
@@ -96,30 +99,33 @@ func (p *Tracer) Constants(_ *exec.FileInfo, offsets *goexec.Offsets) map[string
 		"grpc_stream_method_ptr_pos",
 		"grpc_status_s_pos",
 		"grpc_status_code_ptr_pos",
-		"grpc_st_remoteaddr_ptr_pos",
-		"grpc_st_localaddr_ptr_pos",
+		"grpc_st_conn_pos",
 		"tcp_addr_port_ptr_pos",
 		"tcp_addr_ip_ptr_pos",
-		"grpc_client_target_ptr_pos",
 		"grpc_stream_ctx_ptr_pos",
+		"grpc_t_conn_pos",
+		"grpc_t_scheme_pos",
 		"value_context_val_ptr_pos",
 		"http2_client_next_id_pos",
 		"framer_w_pos",
-		"grpc_peer_localaddr_pos",
-		"grpc_peer_addr_pos",
-		"grpc_st_peer_ptr_pos",
 		"grpc_transport_buf_writer_buf_pos",
 		"grpc_transport_buf_writer_offset_pos",
+		"conn_fd_pos",
+		"fd_laddr_pos",
+		"fd_raddr_pos",
 	} {
-		// Since gRPC 1.60 remoteaddr and localaddr were replaced by peer.
-		// We don't fail the store of unknown fields, we make them -1 so we detect
-		// what to read from the Go structures.
-		if off, ok := offsets.Field[s]; ok {
-			constants[s] = off
-		} else {
-			constants[s] = uint64(0xffffffffffffffff)
+		constants[s] = offsets.Field[s]
+	}
+
+	// fix-up optional
+	for _, s := range []string{
+		"framer_w_pos",
+	} {
+		if constants[s] == nil {
+			constants[s] = uint64(0)
 		}
 	}
+
 	return constants
 }
 
@@ -145,28 +151,38 @@ func (p *Tracer) GoProbes() map[string]ebpfcommon.FunctionPrograms {
 		"google.golang.org/grpc.(*ClientConn).Invoke": {
 			Required: true,
 			Start:    p.bpfObjects.UprobeClientConnInvoke,
+			End:      p.bpfObjects.UprobeClientConnInvokeReturn,
 		},
 		"google.golang.org/grpc.(*ClientConn).NewStream": {
 			Required: true,
 			Start:    p.bpfObjects.UprobeClientConnNewStream,
+			End:      p.bpfObjects.UprobeServerHandleStreamReturn,
 		},
 		"google.golang.org/grpc.(*ClientConn).Close": {
 			Required: true,
 			Start:    p.bpfObjects.UprobeClientConnClose,
 		},
 		"google.golang.org/grpc.(*clientStream).RecvMsg": {
-			End: p.bpfObjects.UprobeClientConnInvokeReturn,
+			End: p.bpfObjects.UprobeClientStreamRecvMsgReturn,
 		},
 		"google.golang.org/grpc.(*clientStream).CloseSend": {
 			End: p.bpfObjects.UprobeClientConnInvokeReturn,
 		},
+		"google.golang.org/grpc/internal/transport.(*http2Client).NewStream": {
+			Start: p.bpfObjects.UprobeTransportHttp2ClientNewStream,
+		},
+		"google.golang.org/grpc/internal/transport.(*http2Server).operateHeaders": {
+			Start: p.bpfObjects.UprobeHttp2ServerOperateHeaders,
+		},
+		"google.golang.org/grpc/internal/transport.(*serverHandlerTransport).HandleStreams": {
+			Start: p.bpfObjects.UprobeServerHandlerTransportHandleStreams,
+		},
+		"net.(*netFD).Read": {
+			Start: p.bpfObjects.UprobeNetFdReadGRPC,
+		},
 	}
 
 	if p.supportsContextPropagation() {
-		m["google.golang.org/grpc/internal/transport.(*http2Client).NewStream"] = ebpfcommon.FunctionPrograms{
-			Required: true,
-			Start:    p.bpfObjects.UprobeTransportHttp2ClientNewStream,
-		}
 		m["golang.org/x/net/http2.(*Framer).WriteHeaders"] = ebpfcommon.FunctionPrograms{
 			Start: p.bpfObjects.UprobeGrpcFramerWriteHeaders,
 			End:   p.bpfObjects.UprobeGrpcFramerWriteHeadersReturns,
@@ -204,6 +220,5 @@ func (p *Tracer) Run(ctx context.Context, eventsChan chan<- []request.Span) {
 		p.pidsFilter,
 		p.bpfObjects.Events,
 		p.metrics,
-		append(p.closers, &p.bpfObjects)...,
-	)(ctx, eventsChan)
+	)(ctx, append(p.closers, &p.bpfObjects), eventsChan)
 }

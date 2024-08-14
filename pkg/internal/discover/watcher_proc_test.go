@@ -33,6 +33,7 @@ func TestWatcher_Poll(t *testing.T) {
 	acc := pollAccounter{
 		interval: time.Microsecond,
 		ctx:      ctx,
+		cfg:      &beyla.Config{},
 		pidPorts: map[pidPort]processAttrs{},
 		listProcesses: func(bool) (map[PID]processAttrs, error) {
 			invocation++
@@ -53,6 +54,9 @@ func TestWatcher_Poll(t *testing.T) {
 			return true
 		},
 		loadBPFWatcher: func(*beyla.Config, chan<- watcher.Event) error {
+			return nil
+		},
+		loadBPFLogger: func(*beyla.Config) error {
 			return nil
 		},
 	}
@@ -125,6 +129,7 @@ func TestProcessNotReady(t *testing.T) {
 	acc := pollAccounter{
 		interval: time.Microsecond,
 		ctx:      context.Background(),
+		cfg:      &beyla.Config{},
 		pidPorts: map[pidPort]processAttrs{},
 		listProcesses: func(bool) (map[PID]processAttrs, error) {
 			return map[PID]processAttrs{p1.pid: p1, p5.pid: p5, p2.pid: p2, p3.pid: p3, p4.pid: p4}, nil
@@ -133,6 +138,9 @@ func TestProcessNotReady(t *testing.T) {
 			return pid >= 3
 		},
 		loadBPFWatcher: func(*beyla.Config, chan<- watcher.Event) error {
+			return nil
+		},
+		loadBPFLogger: func(*beyla.Config) error {
 			return nil
 		},
 	}
@@ -178,11 +186,14 @@ func TestPortsFetchRequired(t *testing.T) {
 		listProcesses: func(bool) (map[PID]processAttrs, error) {
 			return nil, nil
 		},
-		executableReady: func(pid PID) bool {
+		executableReady: func(_ PID) bool {
 			return true
 		},
-		loadBPFWatcher: func(cfg *beyla.Config, events chan<- watcher.Event) error {
+		loadBPFWatcher: func(_ *beyla.Config, events chan<- watcher.Event) error {
 			channelReturner <- events
+			return nil
+		},
+		loadBPFLogger: func(*beyla.Config) error {
 			return nil
 		},
 		stateMux:          sync.Mutex{},

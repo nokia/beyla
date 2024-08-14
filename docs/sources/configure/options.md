@@ -32,13 +32,11 @@ $ BEYLA_OPEN_PORT=8080 BEYLA_CONFIG_PATH=/path/to/config.yaml beyla
 At the end of this document, there is an [example of YAML configuration file](#yaml-file-example).
 
 Currently, Beyla consist of a pipeline of components which
-generate, transform, and export traces from HTTP and GRPC services. In the
+generate, transform, and export traces from HTTP and GRPC applications. In the
 YAML configuration, each component has its own first-level section.
 
-The architecture below shows the different components of Beyla.
-The dashed boxes in the diagram below can be enabled and disabled according to the configuration.
-
-![Grafana Beyla architecture](https://grafana.com/media/docs/grafana-cloud/beyla/architecture-1.1.png)
+Optionally, Beyla also provides network-level metrics, which are documented in the
+[Network metrics section of the Beyla documentation]({{< relref "../network" >}}).
 
 A quick description of the components:
 
@@ -46,11 +44,14 @@ A quick description of the components:
   a given criteria.
 - [EBPF tracer](#ebpf-tracer) instruments the HTTP and GRPC services of an external process,
   creates service traces and forwards them to the next stage of the pipeline.
+- [Configuration of metrics and traces attributes](#configuration-of-metrics-and-traces-attributes) to control
+  which attributes are reported.
 - [Routes decorator](#routes-decorator) will match HTTP paths (e.g. `/user/1234/info`)
   into user-provided HTTP routes (e.g. `/user/{id}/info`). If no routes are defined,
   the incoming data will be directly forwarded to the next stage.
 - [Kubernetes decorator](#kubernetes-decorator) will decorate the metrics and traces
   with Kubernetes metadata of the instrumented Pods.
+- [Filter metrics and traces by attribute values](#filter-metrics-and-traces-by-attribute-values).
 - [Grafana Cloud OTEL exporter for metrics and traces](#using-the-grafana-cloud-otel-endpoint-to-ingest-metrics-and-traces)
   simplifies the submission of OpenTelemetry metrics and traces to Grafana cloud.
 - [OTEL metrics exporter](#otel-metrics-exporter) exports metrics data to an external
@@ -170,13 +171,35 @@ Sets the verbosity level of the process standard output logger.
 Valid log level values are: `DEBUG`, `INFO`, `WARN` and `ERROR`.
 `DEBUG` being the most verbose and `ERROR` the least verbose.
 
-| YAML           | Environment variable              | Type    | Default |
-| -------------- | -------------------- | ------- | ------- |
-| `print_traces` | `BEYLA_PRINT_TRACES` | boolean | `false` |
+| YAML            | Environment variable  | Type    | Default    |
+| --------------  | --------------------- | ------- | ---------- |
+| `trace_printer` | `BEYLA_TRACE_PRINTER` | string  | `disabled` |
 
 <a id="printer"></a>
 
-If `true`, prints any instrumented trace on the standard output (stdout).
+Prints any instrumented trace on the standard output. The value of
+this option specify the format to be used when printing the trace. Valid
+formats are:
+
+| Value         | Description                    |
+|---------------|--------------------------------|
+| `disabled`    | disables the printer           |
+| `text`        | prints a concise line of text  |
+| `json`        | prints a compact JSON object   |
+| `json_indent` | prints an indented JSON object |
+
+| YAML               | Environment variable     | Type     | Default    |
+| -----------------  | ------------------------ | -------- | ---------- |
+| `enforce_sys_caps` | `BEYLA_ENFORCE_SYS_CAPS` | boolean  | `true`     |
+
+<a id="caps"></a>
+
+If you have set the `enforce_sys_caps` to true, if the required system
+capabilities are not present Beyla aborts its startup and logs a list of the
+missing capabilities.
+
+If you have set the configuration option to `false`, Beyla logs a list of the
+missing capabilities only.
 
 ## Service discovery
 
@@ -199,10 +222,10 @@ This section allows specifying different selection criteria for different servic
 as well as overriding some of their metadata, such as their reported name or
 namespace.
 
-For more details about this section, please go to the [discovery services section](#discovery-services-section)
+For more details about this section, go to the [discovery services section](#discovery-services-section)
 of this document.
 
-| YAML                       | Environment variable                          | Type    | Default |
+| YAML                       | Environment variable             | Type    | Default |
 | -------------------------- | -------------------------------- | ------- | ------- |
 | `skip_go_specific_tracers` | `BEYLA_SKIP_GO_SPECIFIC_TRACERS` | boolean | false   |
 
@@ -423,7 +446,7 @@ The preceding example discovers all Pods in the `frontend` namespace that have a
 
 YAML section `ebpf`.
 
-| YAML         | Environment variable                | Type   | Default |
+| YAML         | Environment variable   | Type   | Default |
 | ------------ | ---------------------- | ------ | ------- |
 | `wakeup_len` | `BEYLA_BPF_WAKEUP_LEN` | string | (unset) |
 
@@ -436,7 +459,7 @@ can help with reducing the CPU overhead of Beyla.
 In low-load services (in terms of requests/second), high values of `wakeup_len` could
 add a noticeable delay in the time the metrics are submitted and become externally visible.
 
-| YAML                    | Environment variable                           | Type    | Default |
+| YAML                    | Environment variable              | Type    | Default |
 | ----------------------- | --------------------------------- | ------- | ------- |
 | `track_request_headers` | `BEYLA_BPF_TRACK_REQUEST_HEADERS` | boolean | (false) |
 
@@ -447,15 +470,83 @@ a 'Traceparent' header value, it will use the provided 'trace id' to create its 
 This option does not have an effect on Go applications, where the 'Traceparent' field is always
 processed, without additional tracking of the request headers.
 
-Enabling this option may increase Beyla's performance overhead in high request volume scenarios.
-Please note that this option is only useful when generating Beyla traces, it does not affect
+Enabling this option may increase the performance overhead in high request volume scenarios.
+This option is only useful when generating Beyla traces, it does not affect
 generation of Beyla metrics.
+
+| YAML                    | Environment variable               | Type    | Default |
+| ----------------------- | ---------------------------------- | ------- | ------- |
+| `http_request_timeout`  | `BEYLA_BPF_HTTP_REQUEST_TIMEOUT`   | string  | (30s)   |
+
+Configures the time interval after which an HTTP request is considered as a timeout.
+This option allows Beyla to report HTTP transactions which timeout and never return.
+To disable the automatic HTTP request timeout feature, set this option to zero, i.e. "0ms".
 
 ## Configuration of metrics and traces attributes
 
 Grafana Beyla allows configuring how some attributes for metrics and traces
 are decorated. Under the `attributes` top YAML sections, you can enable
 other subsections configure how some attributes are set.
+
+### Selection of metric attributes
+
+The [Beyla exported metrics]({{< relref "../metrics.md" >}}) document lists the attributes
+that can be reported with each metric. Some of the attributes are reported by default while
+others are hidden to control the cardinality.
+
+For each metric, you can control which attributes to see with the `select` subsection, which
+is a map where each key is the name of a metric (either in its OpenTelemetry or Prometheus port),
+and each metric has two more sub-properties: `include` and `exclude`.
+
+* `include` is a list of attributes that need to be reported. Each attribute can be an attribute
+  name or a wildcard (for example, `k8s.dst.*` to include all the attributes starting with `k8s.dst`).
+  If no `include` list is provided, the default attribute set is reported (check [Beyla exported metrics]({{< relref "../metrics.md" >}})
+  for more information about the default attributes for a given metric).
+* `exclude` is a list to of attribute names/wildcards containing the attributes to remove from the
+  `include` list (or the default attribute set).
+
+Example:
+```yaml
+attributes:
+  select:
+    beyla_network_flow_bytes:
+      # limit the beyla_network_flow_bytes attributes to only the three attributes
+      include:
+        - beyla.ip
+        - src.name
+        - dst.port
+    sql_client_duration:
+      # report all the possible attributes but db_statement
+      include: ["*"]
+      exclude: ["db_statement"]
+    http_client_request_duration:
+      # report the default attribute set but exclude the Kubernetes Pod information
+      exclude: ["k8s.pod.*"]
+```
+
+Additionally, you can use "`*`" wildcards as metric names to add and exclude attributes for
+groups of metrics having the same name. For example:
+
+```yaml
+attributes:
+  select:
+    http_*:
+      include: ["*"]
+      exclude: ["http_path", "http_route"]
+    http_client_*:
+      # override http_* exclusion
+      include: ["http_path"]
+    http_server_*:
+      # override http_* exclusion
+      include: ["http_route"]
+```
+
+In the previous example, all the metrics with a name starting with `http_` (or `http.`) would include all
+the possible attributes but `http_path` and `http_route` (or `http.path`/`http.route`).
+The `http_client_*` and `http_server_*` sections would override the base configuration, enabling the
+`http_path` attribute for the HTTP client metrics and `http_route` for the HTTP server metrics.
+
+When a metric name matches multiple definitions using wildcards, exact matches have higher precedence than wild card matches.
 
 ### Instance ID decoration
 
@@ -473,7 +564,7 @@ attributes:
     dns: false
 ```
 
-| YAML  | Environment variable                         | Type    | Default |
+| YAML  | Environment variable            | Type    | Default |
 | ----- | ------------------------------- | ------- | ------- |
 | `dns` | `BEYLA_HOSTNAME_DNS_RESOLUTION` | boolean | `true`  |
 
@@ -511,6 +602,7 @@ and metrics with the Standard OpenTelemetry labels:
 - `k8s.pod.name`
 - `k8s.pod.uid`
 - `k8s.pod.start_time`
+- `k8s.cluster.name`
 
 In YAML, this section is named `kubernetes`, and is located under the
 `attributes` top-level section. For example:
@@ -522,10 +614,10 @@ attributes:
 ```
 
 It is IMPORTANT to consider that enabling this feature requires a previous step of
-providing some extra permissions to the Beyla Pod. Please check the
+providing some extra permissions to the Beyla Pod. Consult the
 ["Configuring Kubernetes metadata decoration section" in the "Running Beyla in Kubernetes"]({{< relref "../setup/kubernetes.md" >}}) page.
 
-| YAML     | Environment variable                      | Type    | Default |
+| YAML     | Environment variable         | Type    | Default |
 | -------- | ---------------------------- | ------- | ------- |
 | `enable` | `BEYLA_KUBE_METADATA_ENABLE` | boolean | `false` |
 
@@ -643,12 +735,12 @@ Possible values for the `ignore_mode` property are:
 
 Selectively ignoring only certain type of events might be useful in certain scenarios. For example, you may want to
 know the performance metrics of your health check API, but you wouldn't want the overhead of those trace records in
-your target traces database. In this this example scenario, you would set the `ignore_mode` property to `traces`, such
+your target traces database. In this example scenario, you would set the `ignore_mode` property to `traces`, such
 that only traces matching the `ignored_patterns` will be discarded, while metrics will still be recorded.
 
 | YAML        | Environment variable | Type   | Default    |
 | ----------- | ------- | ------ | ---------- |
-| `unmatched` | --      | string | `wildcard` |
+| `unmatched` | --      | string | `heuristic` |
 
 Specifies what to do when a trace HTTP path does not match any of the `patterns` entries.
 
@@ -688,7 +780,7 @@ document/d/*/edit
 ## OTEL metrics exporter
 
 > ℹ️ If you plan to use Beyla to send metrics to Grafana Cloud,
-> please check the [Grafana Cloud OTEL exporter for metrics and traces](#using-the-grafana-cloud-otel-endpoint-to-ingest-metrics-and-traces)
+> consult the [Grafana Cloud OTEL exporter for metrics and traces](#using-the-grafana-cloud-otel-endpoint-to-ingest-metrics-and-traces)
 > section for easier configuration.
 
 YAML section `otel_metrics_export`.
@@ -738,9 +830,9 @@ If this property is not provided, Beyla will guess it according to the following
 - Beyla will guess `http/protobuf` if the port ends in `4318` (`4318`, `14318`, `24318`, ...),
   as `4318` is the usual Port number for the OTEL HTTP collector.
 
-| YAML                   | Environment variable                           | Type | Default |
-| ---------------------- | --------------------------------- | ---- | ------- |
-| `insecure_skip_verify` | `BEYLA_OTEL_INSECURE_SKIP_VERIFY` | bool | `false` |
+| YAML                   | Environment variable              | Type | Default |
+| ---------------------- | --------------------------------- | ------- | ------- |
+| `insecure_skip_verify` | `BEYLA_OTEL_INSECURE_SKIP_VERIFY` | boolean | `false` |
 
 Controls whether the OTEL client verifies the server's certificate chain and host name.
 If set to `true`, the OTEL client accepts any certificate presented by the server
@@ -753,43 +845,49 @@ attacks. This option should be used only for testing and development purposes.
 
 Configures the intervening time between exports.
 
-| YAML            | Environment variable                       | Type    | Default |
-| --------------- | ----------------------------- | ------- | ------- |
-| `report_target` | `BEYLA_METRICS_REPORT_TARGET` | boolean | `false` |
+| YAML       | Environment variable          | Type            | Default                      |
+|------------|-------------------------------|-----------------|------------------------------|
+| `features` | `BEYLA_OTEL_METRICS_FEATURES` | list of strings | `["application"]` |
 
-Specifies whether the exporter must submit `http.target` as a metric attribute.
-
-According to the standard OpenTelemetry specification, `http.target` is the full HTTP request
-path and query arguments.
-
-It is disabled by default to avoid cardinality explosion in paths with IDs. As an alternative,
-it is recommended to group these requests in the [routes' node](#routes-decorator).
-
-| YAML          | Environment variable                     | Type    | Default |
-| ------------- | --------------------------- | ------- | ------- |
-| `report_peer` | `BEYLA_METRICS_REPORT_PEER` | boolean | `false` |
-
-Specifies whether the exporter must submit the caller peer address as a metric attribute.
-
-It is disabled by default to avoid cardinality explosion.
-
-| YAML       | Environment variable         | Type            | Default                      |
-|------------|------------------------------|-----------------|------------------------------|
-| `features` | `BEYLA_OTEL_METRIC_FEATURES` | list of strings | `["application", "network"]` |
-
-A list of metric groups that are allowed to be exported. Each group belongs to a different feature
+A list of metric groups which are allowed to be exported. Each group belongs to a different feature
 of Beyla: application-level metrics or network metrics.
 
 - If the list contains `application`, the Beyla OpenTelemetry exporter exports application-level metrics;
   but only if there is defined an OpenTelemetry endpoint, and Beyla was able to discover any
   process matching the entries in the `discovery` section.
+- If the list contains `application_span`, the Beyla OpenTelemetry exporter exports application-level trace span metrics;
+  but only if there is defined an OpenTelemetry endpoint, and Beyla was able to discover any
+  process matching the entries in the `discovery` section. 
+- If the list contains `application_service_graph`, the Beyla OpenTelemetry exporter exports application-level service graph metrics;
+  but only if there is defined an OpenTelemetry endpoint, and Beyla was able to discover any
+  process matching the entries in the `discovery` section. 
+  For best experience with generating service graph metrics, use a DNS for service discovery and make sure the DNS names match
+  the OpenTelemetry service names used in Beyla. In Kubernetes environments, the OpenTelemetry service name set by the service name
+  discovery is the best choice for service graph metrics.
+- If the list contains `application_process`, the Beyla OpenTelemetry exporter exports metrics about the processes that
+  run the instrumented application.
 - If the list contains `network`, the Beyla OpenTelemetry exporter exports network-level
-  metrics; but only if there is defined an OpenTelemetry endpoint and the
-  [network metrics are enabled]({{< relref "../network" >}}).
+  metrics; but only if there is an OpenTelemetry endpoint defined. For network-level metrics options visit the
+  [network metrics]({{< relref "../network" >}}) configuration documentation.
 
-Usually you do not need to change this configuration option, unless, for example, a Beyla instance
-instruments both network and applications, and you want to disable application-level metrics because
-you only care about application traces, but still want Beyla to send network metrics.
+
+| YAML               | Environment variable                  | Type            | Default                      |
+|--------------------|---------------------------------------|-----------------|------------------------------|
+| `instrumentations` | `BEYLA_OTEL_METRICS_INSTRUMENTATIONS` | list of strings | `["*"]` |
+
+A list of available **instrumentations** which are enabled, defined a comma separated list of strings. 
+By default all available **instrumentations** are enabled, and you can choose to enable only some. 
+The available **instrumentations** are as follows:
+
+- `*` enables all **instrumentations**. If `*` is present in the list, the other values are simply ignored.
+- `http` enables the collection of HTTP/HTTPS/HTTP2 application metrics.
+- `grpc` enables the collection of gRPC application metrics.
+- `sql` enables the collection of SQL database client call metrics.
+- `redis` enables the collection of Redis client/server database metrics.
+- `kafka` enables the collection of Kafka client/server message queue metrics.
+
+For example, setting the `instrumentations` option to: `http,grpc` enables the collection of HTTP/HTTPS/HTTP2 and
+gRPC application metrics, while the rest of the **instrumentations** are be disabled.
 
 | YAML      | Environment variable | Type   |
 | --------- | ------- | ------ |
@@ -864,7 +962,7 @@ for more information.
 ## OTEL traces exporter
 
 > ℹ️ If you plan to use Beyla to send metrics to Grafana Cloud,
-> please check the [Grafana Cloud OTEL exporter for metrics and traces](#using-the-grafana-cloud-otel-endpoint-to-ingest-metrics-and-traces)
+> consult the [Grafana Cloud OTEL exporter for metrics and traces](#using-the-grafana-cloud-otel-endpoint-to-ingest-metrics-and-traces)
 > section for easier configuration.
 
 YAML section `otel_traces_export`.
@@ -895,6 +993,24 @@ the OpenTelemetry exporter will automatically add the `/v1/traces` path to the U
 addition, you can use either the `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` environment variable or the `environment` YAML
 property to use exactly the provided URL without any addition.
 
+| YAML               | Environment variable                  | Type            | Default                      |
+|--------------------|---------------------------------------|-----------------|------------------------------|
+| `instrumentations` | `BEYLA_PROMETHEUS_INSTRUMENTATIONS`   | list of strings | `["*"]` |
+
+A list of available **instrumentations** which are enabled, defined a comma separated list of strings. 
+By default all available **instrumentations** are enabled, and you can choose to enable only some. 
+The available **instrumentations** are as follows:
+
+- `*` enables all **instrumentations**. If `*` is present in the list, the other values are simply ignored.
+- `http` enables the collection of HTTP/HTTPS/HTTP2 application traces.
+- `grpc` enables the collection of gRPC application traces.
+- `sql` enables the collection of SQL database client call traces.
+- `redis` enables the collection of Redis client/server database traces.
+- `kafka` enables the collection of Kafka client/server message queue traces.
+
+For example, setting the `instrumentations` option to: `http,grpc` enables the collection of HTTP/HTTPS/HTTP2 and
+gRPC application traces, while the rest of the **instrumentations** are be disabled.
+
 | YAML       | Environment variable                                                                   | Type   | Default   |
 | ---------- | ------------------------------------------------------------------------- | ------ | --------- |
 | `protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` or<br/>`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | string | (guessed) |
@@ -914,9 +1030,9 @@ If this property is not provided, Beyla will guess it according to the following
 - Beyla will guess `http/protobuf` if the port ends in `4318` (`4318`, `14318`, `24318`, ...),
   as `4318` is the usual Port number for the OTEL HTTP collector.
 
-| YAML                   | Environment variable                           | Type | Default |
-| ---------------------- | --------------------------------- | ---- | ------- |
-| `insecure_skip_verify` | `BEYLA_OTEL_INSECURE_SKIP_VERIFY` | bool | `false` |
+| YAML                   | Environment variable              | Type    | Default |
+| ---------------------- | --------------------------------- | ------- | ------- |
+| `insecure_skip_verify` | `BEYLA_OTEL_INSECURE_SKIP_VERIFY` | boolean | `false` |
 
 Controls whether the OTEL client verifies the server's certificate chain and host name.
 If set to `true`, the OTEL client accepts any certificate presented by the server
@@ -938,7 +1054,7 @@ otel_traces_export:
     arg: "0.1"
 ```
 
-If you are using the Grafana Agent as your OTEL collector, you can configure the sampling
+If you are using the Grafana Alloy as your OTEL collector, you can configure the sampling
 policy at that level instead.
 
 | YAML   | Environment variable               | Type   | Default                 |
@@ -979,6 +1095,44 @@ and `parentbased_traceidratio` require an argument.
 In YAML, this value MUST be provided as a string, so even if the value
 is numeric, make sure that it is enclosed between quotes in the YAML file,
 (for example, `arg: "0.25"`).
+
+## Filter metrics and traces by attribute values
+
+You might want to restrict the reported metrics and traces to very concrete
+event types based on the values of the attributes (for example, filter network
+metrics to report only TCP traffic).
+
+The `filter` YAML section allows filtering both application and network metrics
+by attribute values. It has the following structure:
+
+```yaml
+filter:
+  application:
+    # map of attribute matches to restrict application metrics
+  network:
+    # map of attribute matches to restrict network metrics
+```
+
+For a list of metrics under the application and network family, as well as their
+attributes, check the [Beyla exported metrics]({{< relref "../metrics.md" >}}) document.
+
+Each `application` and `network` filter section is a map where each key is an attribute
+name (either in Prometheus or OpenTelemetry format), with either the `match` or the `not_match` property. Both properties accept a 
+[glob-like](https://github.com/gobwas/glob) string (it can be a full value or include
+wildcards). If the `match` property is set, Beyla only reports the metrics and traces
+matching the provided value for that given attribute. The `not_match` property is the
+negation of `match`.
+
+The following example reports network metrics for connections targeting the destination port 53, excluding the UDP protocol:
+
+```yaml
+filter:
+  network:
+    transport:
+      not_match: UDP
+    dst_port:
+      match: "53"
+```
 
 ## Using the Grafana Cloud OTEL endpoint to ingest metrics and traces
 
@@ -1038,14 +1192,14 @@ YAML section `prometheus_export`.
 
 This component opens an HTTP endpoint in the auto-instrumentation tool
 that allows any external scraper to pull metrics in [Prometheus](https://prometheus.io/)
-format. It will be enabled if the `port` property is set.
+format. It is enabled if the `port` property is set.
 
 | YAML   | Environment variable                 | Type | Default |
 | ------ | ----------------------- | ---- | ------- |
 | `port` | `BEYLA_PROMETHEUS_PORT` | int  | (unset) |
 
 Specifies the HTTP port for the Prometheus scrape endpoint. If unset or 0,
-no Prometheus endpoint will be open.
+no Prometheus endpoint is open.
 
 | YAML   | Environment variable                 | Type   | Default    |
 | ------ | ----------------------- | ------ | ---------- |
@@ -1053,25 +1207,14 @@ no Prometheus endpoint will be open.
 
 Specifies the HTTP query path to fetch the list of Prometheus metrics.
 
-| YAML            | Environment variable                       | Type    | Default |
-| --------------- | ----------------------------- | ------- | ------- |
-| `report_target` | `BEYLA_METRICS_REPORT_TARGET` | boolean | `false` |
+| YAML  | Environment variable   | Type     | Default |
+|-------|------------------------|----------|---------|
+| `ttl` | `BEYLA_PROMETHEUS_TTL` | Duration | `5m`    |
 
-Specifies whether the exporter must submit `http_target` as a metric attribute.
+The group of attributes for a metric instance is not reported anymore if the time since
+the last update is greater than this Time-To-Leave (TTL) value.
 
-To be consistent with the OpenTelemetry specification, `http_target` is the full HTTP request
-path and query arguments.
-
-It is disabled by default to avoid cardinality explosion in paths with IDs. As an alternative,
-it is recommended to group these requests in the [routes' node](#routes-decorator).
-
-| YAML          | Environment variable                     | Type    | Default |
-| ------------- | --------------------------- | ------- | ------- |
-| `report_peer` | `BEYLA_METRICS_REPORT_PEER` | boolean | `false` |
-
-Specifies whether the exporter must submit the caller peer address as a metric attribute.
-
-It is disabled by default to avoid cardinality explosion.
+The purpose of this value is to avoid reporting indefinitely finished application instances.
 
 | YAML      | Environment variable | Type   |
 | --------- | ------- | ------ |
@@ -1082,7 +1225,7 @@ The `buckets` object allows overriding the bucket boundaries of diverse histogra
 
 | YAML       | Environment variable        | Type            | Default                      |
 |------------|-----------------------------|-----------------|------------------------------|
-| `features` | `BEYLA_PROMETHEUS_FEATURES` | list of strings | `["application", "network"]` |
+| `features` | `BEYLA_PROMETHEUS_FEATURES` | list of strings | `["application"]` |
 
 A list of metric groups that are allowed to be exported. Each group belongs to a different feature
 of Beyla: application-level metrics or network metrics.
@@ -1090,13 +1233,39 @@ of Beyla: application-level metrics or network metrics.
 - If the list contains `application`, the Beyla Prometheus exporter exports application-level metrics;
   but only if the Prometheus `port` property is defined, and Beyla was able to discover any
   process matching the entries in the `discovery` section.
+- If the list contains `application_span`, the Beyla Prometheus exporter exports application-level metrics in traces span metrics format;
+  but only if the Prometheus `port` property is defined, and Beyla was able to discover any
+  process matching the entries in the `discovery` section.
+- If the list contains `application_service_graph`, the Beyla Prometheus exporter exports application-level service graph metrics;
+  but only if the Prometheus `port` property is defined, and Beyla was able to discover any
+  process matching the entries in the `discovery` section.
+  For best experience with generating service graph metrics, use a DNS for service discovery and make sure the DNS names match
+  the OpenTelemetry service names used in Beyla. In Kubernetes environments, the OpenTelemetry service name set by the service name
+  discovery is the best choice for service graph metrics.
+- If the list contains `application_process`, the Beyla Prometheus exporter exports metrics about the processes that
+  run the instrumented application.
 - If the list contains `network`, the Beyla Prometheus exporter exports network-level
-  metrics; but only if the Prometheus `port` property is defined and the
-  [network metrics are enabled]({{< relref "../network" >}}).
+  metrics; but only if the Prometheus `port` property is defined. For network-level metrics options visit the
+  [network metrics]({{< relref "../network" >}}) configuration documentation.
 
-Usually you do not need to change this configuration option, unless, for example, a Beyla instance
-instruments both network and applications, and you want to disable application-level metrics because
-you only care about application traces, but still want Beyla to send network metrics.
+
+| YAML               | Environment variable                  | Type            | Default                      |
+|--------------------|---------------------------------------|-----------------|------------------------------|
+| `instrumentations` | `BEYLA_PROMETHEUS_INSTRUMENTATIONS`   | list of strings | `["*"]` |
+
+A list of available **instrumentations** which are enabled, defined a comma separated list of strings. 
+By default all available **instrumentations** are enabled, and you can choose to enable only some. 
+The available **instrumentations** are as follows:
+
+- `*` enables all **instrumentations**. If `*` is present in the list, the other values are simply ignored.
+- `http` enables the collection of HTTP/HTTPS/HTTP2 application metrics.
+- `grpc` enables the collection of gRPC application metrics.
+- `sql` enables the collection of SQL database client call metrics.
+- `redis` enables the collection of Redis client/server database metrics.
+- `kafka` enables the collection of Kafka client/server message queue metrics.
+
+For example, setting the `instrumentations` option to: `http,grpc` enables the collection of HTTP/HTTPS/HTTP2 and
+gRPC application metrics, while the rest of the **instrumentations** are be disabled.
 
 ## Internal metrics reporter
 

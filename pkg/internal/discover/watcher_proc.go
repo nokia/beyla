@@ -10,12 +10,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mariomac/pipes/pkg/node"
-	"github.com/shirou/gopsutil/net"
-	"github.com/shirou/gopsutil/process"
+	"github.com/mariomac/pipes/pipe"
+	"github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/process"
 
 	"github.com/grafana/beyla/pkg/beyla"
 	"github.com/grafana/beyla/pkg/internal/ebpf"
+	"github.com/grafana/beyla/pkg/internal/ebpf/logger"
 	"github.com/grafana/beyla/pkg/internal/ebpf/watcher"
 	"github.com/grafana/beyla/pkg/services"
 )
@@ -23,13 +24,6 @@ import (
 const (
 	defaultPollInterval = 5 * time.Second
 )
-
-// ProcessWatcher polls every PollInterval for new processes and forwards either new or deleted process PIDs
-// as well as PIDs from processes that setup a new connection
-type ProcessWatcher struct {
-	Ctx context.Context
-	Cfg *beyla.Config
-}
 
 type WatchEventType int
 
@@ -56,25 +50,28 @@ func wplog() *slog.Logger {
 	return slog.With("component", "discover.ProcessWatcher")
 }
 
-func ProcessWatcherProvider(w ProcessWatcher) (node.StartFunc[[]Event[processAttrs]], error) {
+// ProcessWatcherFunc polls every PollInterval for new processes and forwards either new or deleted process PIDs
+// as well as PIDs from processes that setup a new connection
+func ProcessWatcherFunc(ctx context.Context, cfg *beyla.Config) pipe.StartFunc[[]Event[processAttrs]] {
 	acc := pollAccounter{
-		ctx:               w.Ctx,
-		cfg:               w.Cfg,
-		interval:          w.Cfg.Discovery.PollInterval,
+		ctx:               ctx,
+		cfg:               cfg,
+		interval:          cfg.Discovery.PollInterval,
 		pids:              map[PID]processAttrs{},
 		pidPorts:          map[pidPort]processAttrs{},
 		listProcesses:     fetchProcessPorts,
 		executableReady:   executableReady,
 		loadBPFWatcher:    loadBPFWatcher,
+		loadBPFLogger:     loadBPFLogger,
 		fetchPorts:        true,  // must be true until we've activated the bpf watcher component
 		bpfWatcherEnabled: false, // async set by listening on the bpfWatchEvents channel
 		stateMux:          sync.Mutex{},
-		findingCriteria:   FindingCriteria(w.Cfg),
+		findingCriteria:   FindingCriteria(cfg),
 	}
 	if acc.interval == 0 {
 		acc.interval = defaultPollInterval
 	}
-	return acc.Run, nil
+	return acc.Run
 }
 
 // pidPort associates a PID with its open port
@@ -100,6 +97,7 @@ type pollAccounter struct {
 	executableReady func(PID) bool
 	// injectable function to load the bpf program
 	loadBPFWatcher func(cfg *beyla.Config, events chan<- watcher.Event) error
+	loadBPFLogger  func(cfg *beyla.Config) error
 	// we use these to ensure we poll for the open ports effectively
 	stateMux          sync.Mutex
 	bpfWatcherEnabled bool
@@ -113,6 +111,12 @@ func (pa *pollAccounter) Run(out chan<- []Event[processAttrs]) {
 	bpfWatchEvents := make(chan watcher.Event, 100)
 	if err := pa.loadBPFWatcher(pa.cfg, bpfWatchEvents); err != nil {
 		log.Error("Unable to load eBPF watcher for process events", "error", err)
+	}
+
+	if pa.cfg.EBPF.BpfDebug {
+		if err := pa.loadBPFLogger(pa.cfg); err != nil {
+			log.Error("Unable to load eBPF logger for process events", "error", err)
+		}
 	}
 
 	go pa.watchForProcessEvents(log, bpfWatchEvents)
@@ -323,5 +327,10 @@ func fetchProcessPorts(scanPorts bool) (map[PID]processAttrs, error) {
 
 func loadBPFWatcher(cfg *beyla.Config, events chan<- watcher.Event) error {
 	wt := watcher.New(cfg, events)
+	return ebpf.RunUtilityTracer(wt, BuildPinPath(cfg))
+}
+
+func loadBPFLogger(cfg *beyla.Config) error {
+	wt := logger.New(cfg)
 	return ebpf.RunUtilityTracer(wt, BuildPinPath(cfg))
 }

@@ -1,7 +1,16 @@
-run:
-  skip-dirs:
+issues:
+  exclude-dirs:
     - configs
     - docs
+  exclude-rules:
+    # revive returns false indent-error-flow errors in some cases where
+    # an "else" clause is required to access the if condition context
+    - path: .*
+      linters:
+        - revive
+      text: indent-error-flow
+run:
+  go: "1.22"
   build-tags:
     - integration
 linters:
@@ -18,21 +27,18 @@ linters:
     - ineffassign
     - revive
     - staticcheck
-#    - structcheck Disable until they properly support generics
     - stylecheck
     - typecheck
     - unused
   disable:
     - exhaustive
 linters-settings:
-  stylecheck:
-    go: "1.21"
   gocritic:
     enabled-checks:
       - rangeExprCopy
       - rangeValCopy
       - indexAlloc
-      - deprecatedComment
+      - commentedOutCode
   cyclop:
     max-complexity: 12
 
